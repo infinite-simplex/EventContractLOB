@@ -22,6 +22,21 @@ egress (no public ITCH feed yet).
 
 Design rationale and tradeoffs are written up separately outside this repo.
 
+## Limits
+
+- **Price:** whole cents, 0–100 inclusive (a contract that settles at $0.00 or
+  $1.00). On the wire this is OUCH's real fixed point (dollars × 10,000, so
+  $0.42 is `4200`); a sub-cent remainder is truncated, and anything above 100
+  cents is rejected with `PRICE_OUT_OF_RANGE`.
+- **Quantity:** unsigned, 1–999,999 shares, matching OUCH's "> 0 and
+  < 1,000,000". An enter or replace outside that range is rejected with
+  `INVALID_QUANTITY`. A cancel's `shares = 0` still means "cancel all
+  remaining".
+
+Both checks run in the OUCH handler (a bad frame becomes a rejected command
+without dropping the connection) and again in the book, so nothing that
+bypasses the handler can rest an out-of-range order.
+
 ## Building and running
 
 Linux only (uses `epoll`, `mmap`, multicast sockets, `CLOCK_TAI` directly —
