@@ -245,7 +245,7 @@ public:
             .side{order_ptr->get_side()},
             .price{order_ptr->get_price()},
             .quantity{order_ptr->get_remaining_quantity()},
-            .leaves_quantity{order_ptr->get_remaining_quantity()},
+            .leaves_quantity{0}, // the whole resting order was removed
             .match_id{0},
             .reject_reason{RejectReason::NONE}
             });
@@ -462,6 +462,15 @@ public:
             return;
         }
 
+        // CANCEL_ORDER's shares is "cancel all remaining" when 0, so it's the
+        // one command type where a zero quantity is meaningful.
+        if (cmd.type != CommandType::CANCEL_ORDER && !is_valid_order_quantity(cmd.shares)) {
+            reject_invalid_quantity(cmd.orderId, 0, cmd.sessionId,
+                cmd.buySellIndicator == 'B' ? SIDE::BID : SIDE::ASK, cmd.price, cmd.shares);
+            complete_trace(m_telemetry_policy, cmd.trace_id);
+            return;
+        }
+
         Order local_order = create_order_from_command(cmd);
         match_order(local_order);
 
@@ -484,6 +493,13 @@ public:
 
 
     void submit_order(Order& order) {
+        if (order.get_type() != ORDER_TYPE::CANCEL && !is_valid_order_quantity(order.get_initial_quantity())) {
+            reject_invalid_quantity(order.get_id(), order.get_firm_id(), order.m_session_id,
+                order.get_side(), order.get_price(), order.get_initial_quantity());
+            complete_trace(m_telemetry_policy, order.m_telemetry_idx);
+            return;
+        }
+
         match_order(order);
 
         // Same reasoning as the OuchOrderCommand overload above — keep the
@@ -516,6 +532,27 @@ private:
     BidBook m_bid_book;
     AskBook m_ask_book;
     Clock m_matching_clock;
+
+    // Rejects an order whose quantity is outside (0, MAX_ORDER_QUANTITY],
+    // echoing the offending quantity. The caller completes the trace: no
+    // Order ever rested, so nothing later will.
+    void reject_invalid_quantity(OrderId orderId, FirmId firmId, SessionId sessionId, SIDE side, Price price,
+        Quantity quantity) {
+        m_telemetry_policy.on_order_event(OrderEvent{
+            .type{OrderEventType::REJECTED},
+            .timestamp{get_synced_time_ns()},
+            .sequence_number{m_next_sequence_number++},
+            .order_id{orderId},
+            .firm_id{firmId},
+            .session_id{sessionId},
+            .side{side},
+            .price{price},
+            .quantity{quantity},
+            .leaves_quantity{0},
+            .match_id{0},
+            .reject_reason{RejectReason::INVALID_QUANTITY}
+            });
+    }
 
     [[nodiscard]] Order create_order_from_command(const OuchOrderCommand& cmd) noexcept {
         // Wire message kind (Enter/Cancel/Replace) decides CANCEL; only an
@@ -576,6 +613,16 @@ private:
                 .match_id{0},
                 .reject_reason{RejectReason::PRICE_OUT_OF_RANGE}
                 });
+            complete_trace(m_telemetry_policy, cmd.trace_id);
+            return;
+        }
+
+        // A replace can't shrink an order to nothing (that's a cancel) or
+        // exceed the enter limit; the existing order is left untouched, same
+        // as the price reject above.
+        if (!is_valid_order_quantity(cmd.shares)) {
+            reject_invalid_quantity(cmd.orderId, existing->get_firm_id(), cmd.sessionId,
+                existing->get_side(), cmd.price, cmd.shares);
             complete_trace(m_telemetry_policy, cmd.trace_id);
             return;
         }
@@ -651,9 +698,10 @@ private:
     }
         
     void fill_or_kill(Order& order) {
-        // dry_run_available_quantity ignores self-trade prevention, so this
-        // preflight check can pass more quantity than actually ends up
-        // filling once STP carves some of it back out below.
+        // dry_run_available_quantity stops at the first resting order from the
+        // same firm (mirroring walk_price_level's STP hard stop), so a FOK that
+        // would have to trade through its own firm's order is killed up front
+        // rather than partially filled.
         if (order.get_side() == SIDE::BID && m_ask_book.dry_run_available_quantity(order, order.get_initial_quantity()) < order.get_initial_quantity()) {
             m_telemetry_policy.on_order_event(OrderEvent{
                 .type{OrderEventType::REJECTED},

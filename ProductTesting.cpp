@@ -14,6 +14,7 @@
 #include "OuchOrderCommand.hpp"
 #include "IGoodTillDayScheduler.hpp"
 #include <vector>
+#include <limits>
 #include <cstring>
 #include <chrono>
 #include <thread>
@@ -196,8 +197,8 @@ TEST_F(MatchingEngineTest, CancelRestingAskEmitsCanceledEventAndRemovesItFromBoo
     EXPECT_EQ(ask.get_id(), events[0].order_id);
     EXPECT_EQ(FIRM_A, events[0].firm_id);
     EXPECT_EQ(Price(50), events[0].price);
-    EXPECT_EQ(Quantity(100), events[0].quantity);
-    EXPECT_EQ(Quantity(100), events[0].leaves_quantity);
+    EXPECT_EQ(Quantity(100), events[0].quantity) << "quantity is the amount canceled";
+    EXPECT_EQ(Quantity(0), events[0].leaves_quantity) << "nothing is left resting after a full cancel";
 
     EXPECT_EQ(Price(INVALID_PRICE), LOB.get_best_ask());
     EXPECT_EQ(Quantity(0), LOB.get_ask_quantity());
@@ -216,6 +217,8 @@ TEST_F(MatchingEngineTest, CancelRestingBidEmitsCanceledEventAndRemovesItFromBoo
     ASSERT_EQ(size_t(1), events.size());
     EXPECT_EQ(OrderEventType::CANCELED, events[0].type);
     EXPECT_EQ(bid.get_id(), events[0].order_id);
+    EXPECT_EQ(Quantity(100), events[0].quantity);
+    EXPECT_EQ(Quantity(0), events[0].leaves_quantity);
 
     EXPECT_EQ(Price(INVALID_PRICE), LOB.get_best_bid());
     EXPECT_EQ(Quantity(0), LOB.get_bid_quantity());
@@ -415,11 +418,25 @@ TEST_F(MatchingEngineTest, PartialQualifyingLiquidityFillsAvailableAndDropsRest)
     Order iocBid(2, FIRM_B, SIDE::BID, ORDER_TYPE::IMMEDIATE_OR_CANCEL, 55, 200);
     LOB.submit_order(iocBid);
 
-    ASSERT_GE(events.size(), size_t(3));
+    // One fill pair (maker + taker) for the 60 available, then the cancel of the rest.
+    ASSERT_EQ(size_t(3), events.size());
 
-    // Check cancellation of unfilled portion
-    EXPECT_EQ(events.back().reject_reason, RejectReason::NONE);
-    EXPECT_EQ(events.back().type, OrderEventType::CANCELED);
+    EXPECT_EQ(OrderEventType::EXECUTED, events[0].type);
+    EXPECT_EQ(OrderId(1), events[0].order_id);
+    EXPECT_EQ(Quantity(60), events[0].quantity);
+    EXPECT_EQ(Quantity(0), events[0].leaves_quantity);
+
+    EXPECT_EQ(OrderEventType::EXECUTED, events[1].type);
+    EXPECT_EQ(OrderId(2), events[1].order_id);
+    EXPECT_EQ(Quantity(60), events[1].quantity);
+    EXPECT_EQ(Quantity(140), events[1].leaves_quantity);
+
+    // Cancellation of the unfilled portion
+    EXPECT_EQ(OrderEventType::CANCELED, events[2].type);
+    EXPECT_EQ(OrderId(2), events[2].order_id);
+    EXPECT_EQ(Quantity(140), events[2].quantity);
+    EXPECT_EQ(Quantity(0), events[2].leaves_quantity);
+    EXPECT_EQ(RejectReason::NONE, events[2].reject_reason);
 
     EXPECT_EQ(Quantity(0), LOB.get_ask_quantity());
     EXPECT_EQ(Quantity(0), LOB.get_bid_quantity());
@@ -783,6 +800,137 @@ TEST_F(MatchingEngineTest, MaxUint8WirePriceIsRejectedNotIndexed) {
 }
 
 // =====================================================================
+// Quantity validation — OUCH requires shares > 0 and < 1,000,000, i.e. valid
+// quantities are 1..MAX_ORDER_QUANTITY (999,999). CANCEL is the one exception:
+// its shares == 0 means "cancel all remaining" (see
+// CancelOrderCommandResolvesTokenAndCancelsRestingOrder).
+// =====================================================================
+
+TEST_F(MatchingEngineTest, QuantityLimitIsInclusiveAtMaxOrderQuantity) {
+    static_assert(MAX_ORDER_QUANTITY == 999'999, "OUCH: shares < 1,000,000");
+
+    auto atLimit = make_enter_order_command(1, "MAX-QTY000001", 'B', MAX_ORDER_QUANTITY, 50, ORDER_TYPE::LIMIT);
+    LOB.submit_order(atLimit);
+
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::ACCEPTED, events[0].type);
+    EXPECT_EQ(MAX_ORDER_QUANTITY, events[0].quantity);
+    EXPECT_EQ(MAX_ORDER_QUANTITY, LOB.get_bid_quantity());
+
+    events.clear();
+
+    auto overLimit = make_enter_order_command(2, "MAX-QTY000002", 'B', MAX_ORDER_QUANTITY + 1, 50,
+        ORDER_TYPE::LIMIT);
+    LOB.submit_order(overLimit);
+
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::REJECTED, events[0].type);
+    EXPECT_EQ(RejectReason::INVALID_QUANTITY, events[0].reject_reason);
+    EXPECT_EQ(Quantity(1'000'000), events[0].quantity) << "the offending quantity is echoed back";
+    EXPECT_EQ(MAX_ORDER_QUANTITY, LOB.get_bid_quantity()) << "the rejected order must not rest";
+}
+
+TEST_F(MatchingEngineTest, ZeroQuantityEnterOrderIsRejectedAndNeverRests) {
+    auto cmd = make_enter_order_command(1, "ZERO-QTY0001", 'B', 0, 50, ORDER_TYPE::LIMIT);
+    LOB.submit_order(cmd);
+
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::REJECTED, events[0].type);
+    EXPECT_EQ(RejectReason::INVALID_QUANTITY, events[0].reject_reason);
+    EXPECT_EQ(OrderId(1), events[0].order_id);
+    EXPECT_EQ(SIDE::BID, events[0].side);
+    EXPECT_EQ(Quantity(0), events[0].quantity);
+    EXPECT_EQ(Price(INVALID_PRICE), LOB.get_best_bid());
+    EXPECT_EQ(Quantity(0), LOB.get_bid_quantity());
+    EXPECT_EQ(size_t(1), traces.size())
+        << "a rejected order has no later cancel/eviction to complete its trace — submit_order must do it directly";
+}
+
+TEST_F(MatchingEngineTest, InvalidQuantityOrderOfAnyTypeIsRejectedWithoutTouchingTheBook) {
+    // Resting liquidity so an invalid-quantity aggressor that wrongly proceeded
+    // would have something to trade against (or fill trivially against).
+    Order ask(1, FIRM_A, SIDE::ASK, ORDER_TYPE::LIMIT, 50, 100);
+    LOB.submit_order(ask);
+    events.clear();
+    traces.clear();
+
+    const ORDER_TYPE types[] = {
+        ORDER_TYPE::LIMIT, ORDER_TYPE::IMMEDIATE_OR_CANCEL, ORDER_TYPE::FILL_OR_KILL,
+        ORDER_TYPE::MARKET, ORDER_TYPE::GOOD_TILL_CANCEL, ORDER_TYPE::MODIFY,
+    };
+    const Quantity badQuantities[] = { 0, MAX_ORDER_QUANTITY + 1, std::numeric_limits<Quantity>::max() };
+    OrderId nextId = 10;
+    size_t rejected = 0;
+    for (Quantity badQuantity : badQuantities) {
+        for (ORDER_TYPE type : types) {
+            events.clear();
+            Order bad(nextId++, FIRM_B, SIDE::BID, type, 55, badQuantity);
+            LOB.submit_order(bad);
+            ++rejected;
+
+            ASSERT_EQ(size_t(1), events.size())
+                << "order type " << static_cast<int>(type) << ", quantity " << badQuantity;
+            EXPECT_EQ(OrderEventType::REJECTED, events[0].type)
+                << "order type " << static_cast<int>(type) << ", quantity " << badQuantity;
+            EXPECT_EQ(RejectReason::INVALID_QUANTITY, events[0].reject_reason)
+                << "order type " << static_cast<int>(type) << ", quantity " << badQuantity;
+            EXPECT_EQ(badQuantity, events[0].quantity);
+        }
+    }
+
+    EXPECT_EQ(rejected, traces.size()) << "every rejected order completes its own trace";
+    EXPECT_EQ(Price(50), LOB.get_best_ask());
+    EXPECT_EQ(Quantity(100), LOB.get_ask_quantity());
+    EXPECT_EQ(Price(INVALID_PRICE), LOB.get_best_bid());
+    EXPECT_EQ(Quantity(0), LOB.get_bid_quantity());
+}
+
+TEST_F(MatchingEngineTest, ReplaceWithZeroQuantityIsRejectedAndLeavesTheOriginalOrder) {
+    auto enter = make_enter_order_command(1, "REPL-ZERO0001", 'B', 100, 50, ORDER_TYPE::LIMIT);
+    LOB.submit_order(enter);
+
+    events.clear();
+    traces.clear();
+
+    auto replace = make_replace_order_command(1, 2, "REPL-ZERO0002", 0, 60);
+    LOB.submit_order(replace);
+
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::REJECTED, events[0].type);
+    EXPECT_EQ(RejectReason::INVALID_QUANTITY, events[0].reject_reason);
+    EXPECT_EQ(SIDE::BID, events[0].side) << "side is inherited from the order being replaced";
+    EXPECT_EQ(Price(50), LOB.get_best_bid()) << "the original order must be untouched by a rejected replace";
+    EXPECT_EQ(Quantity(100), LOB.get_bid_quantity());
+    EXPECT_EQ(size_t(1), traces.size()) << "the rejected replace's own trace still completes";
+}
+
+TEST_F(MatchingEngineTest, ReplaceAboveMaxQuantityIsRejectedAndLeavesTheOriginalOrder) {
+    auto enter = make_enter_order_command(1, "REPL-BIG00001", 'B', 100, 50, ORDER_TYPE::LIMIT);
+    LOB.submit_order(enter);
+
+    events.clear();
+
+    auto replace = make_replace_order_command(1, 2, "REPL-BIG00002", MAX_ORDER_QUANTITY + 1, 60);
+    LOB.submit_order(replace);
+
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::REJECTED, events[0].type);
+    EXPECT_EQ(RejectReason::INVALID_QUANTITY, events[0].reject_reason);
+    EXPECT_EQ(Price(50), LOB.get_best_bid()) << "the original order must be untouched by a rejected replace";
+    EXPECT_EQ(Quantity(100), LOB.get_bid_quantity());
+
+    // The limit is inclusive here too: a replace to exactly MAX goes through.
+    events.clear();
+    auto atLimit = make_replace_order_command(1, 3, "REPL-BIG00003", MAX_ORDER_QUANTITY, 60);
+    LOB.submit_order(atLimit);
+
+    ASSERT_EQ(size_t(2), events.size());
+    EXPECT_EQ(OrderEventType::CANCELED, events[0].type);
+    EXPECT_EQ(OrderEventType::REPLACED, events[1].type);
+    EXPECT_EQ(MAX_ORDER_QUANTITY, LOB.get_bid_quantity());
+}
+
+// =====================================================================
 // Modify Trade Type
 // =====================================================================
 
@@ -817,7 +965,8 @@ TEST_F(MatchingEngineTest, ModifyChangesQueuePosition) {
 
     events.clear();
 
-    Order marketOrder(4, FIRM_C, SIDE::ASK, ORDER_TYPE::MARKET, 50, 50);
+    // Big enough to consume order 2 (100) and reach into order 1 (30).
+    Order marketOrder(4, FIRM_C, SIDE::ASK, ORDER_TYPE::MARKET, 50, 120);
     LOB.submit_order(marketOrder);
 
     std::vector<OrderEvent> fills;
@@ -827,8 +976,13 @@ TEST_F(MatchingEngineTest, ModifyChangesQueuePosition) {
         }
     }
 
-    ASSERT_GE(fills.size(), size_t(1));
-    EXPECT_EQ(2, fills[0].order_id); // Order 2 was prioritized over modified Order 1
+    ASSERT_EQ(size_t(4), fills.size());
+    EXPECT_EQ(OrderId(2), fills[0].order_id); // Order 2 was prioritized over modified Order 1
+    EXPECT_EQ(Quantity(100), fills[0].quantity);
+    EXPECT_EQ(OrderId(1), fills[2].order_id); // modified Order 1 went to the back of the queue
+    EXPECT_EQ(Quantity(20), fills[2].quantity);
+    EXPECT_EQ(Quantity(10), fills[2].leaves_quantity);
+    EXPECT_EQ(Quantity(10), LOB.get_bid_quantity());
 }
 
 // =====================================================================
@@ -940,6 +1094,7 @@ TEST_F(MatchingEngineTest, CancelOrderCommandResolvesTokenAndCancelsRestingOrder
     EXPECT_EQ(FIRM_A, events[0].firm_id);
     EXPECT_EQ(Price(50), events[0].price);
     EXPECT_EQ(Quantity(100), events[0].quantity);
+    EXPECT_EQ(Quantity(0), events[0].leaves_quantity);
     EXPECT_EQ(Price(INVALID_PRICE), LOB.get_best_bid());
     EXPECT_EQ(Quantity(0), LOB.get_bid_quantity());
     // Two completions: the target order's own trace (left open since it
@@ -1088,7 +1243,7 @@ TEST_F(MatchingEngineTest, SameFirmMarketOrderDoesNotSelfMatch) {
     EXPECT_EQ(Quantity(100), LOB.get_ask_quantity());
 }
 
-TEST_F(MatchingEngineTest, PreflightCheckIgnoresOwnFirmAndCanPartiallyFill) {
+TEST_F(MatchingEngineTest, FillOrKillPreflightStopsAtOwnFirmAndKillsWithNoFill) {
     Order otherFirmAsk(1, FIRM_B, SIDE::ASK, ORDER_TYPE::LIMIT, 50, 40);
     Order ownFirmAsk(2, FIRM_A, SIDE::ASK, ORDER_TYPE::LIMIT, 50, 60);
     LOB.submit_order(otherFirmAsk);
@@ -1096,11 +1251,17 @@ TEST_F(MatchingEngineTest, PreflightCheckIgnoresOwnFirmAndCanPartiallyFill) {
 
     events.clear();
 
+    // 100 is only reachable by trading through FIRM_A's own resting ask (only
+    // 40 of it is genuinely available), so the FOK must die without filling
+    // even the 40 that would have been legal.
     Order fokBid(3, FIRM_A, SIDE::BID, ORDER_TYPE::FILL_OR_KILL, 55, 100);
     LOB.submit_order(fokBid);
 
     ASSERT_FALSE(events.empty());
     EXPECT_EQ(events.back().reject_reason, RejectReason::INSUFFICIENT_LIQUIDITY);
+    for (const auto& ev : events) {
+        EXPECT_NE(OrderEventType::EXECUTED, ev.type) << "a killed FOK must not partially fill";
+    }
     EXPECT_EQ(Quantity(100), LOB.get_ask_quantity());
     EXPECT_EQ(Quantity(0), LOB.get_bid_quantity());
 }
@@ -1158,17 +1319,44 @@ TEST_F(MatchingEngineTest, ImmediateOrCancelWithNoLiquidityCompletesItsOwnTrace)
     EXPECT_EQ(size_t(1), traces.size());
 }
 
+// Every Order built directly in these tests has m_telemetry_idx == 0, so they
+// all share g_telemetry_arena slot 0, and completing a trace doesn't reset it —
+// counters accumulate across tests. Snapshot before, assert on the delta.
+// Two levels / three resting orders makes the two LobExtSlot counters differ
+// (2 vs 3), so a swapped or mis-indexed slot is caught too.
+TEST_F(MatchingEngineTest, CrossingOrderBumpsLobExtCountersPerLevelAndPerRestingOrder) {
+    Order ask1(1, FIRM_A, SIDE::ASK, ORDER_TYPE::LIMIT, 50, 60);
+    Order ask2(2, FIRM_C, SIDE::ASK, ORDER_TYPE::LIMIT, 50, 60);
+    Order ask3(3, FIRM_A, SIDE::ASK, ORDER_TYPE::LIMIT, 51, 60);
+    LOB.submit_order(ask1);
+    LOB.submit_order(ask2);
+    LOB.submit_order(ask3);
+
+    constexpr auto kPriceLevels = static_cast<size_t>(LobExtSlot::PriceLevelsTouched);
+    constexpr auto kRestingOrders = static_cast<size_t>(LobExtSlot::RestingOrdersTouched);
+    OrderTrace& trace = g_telemetry_arena[trace_index(0)];
+    const auto levelsBefore = trace.ext_counters[kPriceLevels];
+    const auto ordersBefore = trace.ext_counters[kRestingOrders];
+
+    // Consumes both orders at 50 and 10 of the order at 51.
+    Order bid(4, FIRM_B, SIDE::BID, ORDER_TYPE::LIMIT, 51, 130);
+    LOB.submit_order(bid);
+
+    EXPECT_EQ(2, trace.ext_counters[kPriceLevels] - levelsBefore) << "walked the level at 50 and the level at 51";
+    EXPECT_EQ(3, trace.ext_counters[kRestingOrders] - ordersBefore) << "touched ask1, ask2 and ask3";
+}
+
 // =====================================================================
 // Spread / quantity helpers
 // =====================================================================
 
-TEST_F(MatchingEngineTest, ReturnsZeroWhenAskSideIsEmpty) {
+TEST_F(MatchingEngineTest, SpreadIsInvalidPriceWhenAskSideIsEmpty) {
     Order bid(1, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 50, 100);
     LOB.submit_order(bid);
     EXPECT_EQ(Price(INVALID_PRICE), LOB.get_bid_ask_spread());
 }
 
-TEST_F(MatchingEngineTest, ReturnsZeroWhenBidSideIsEmpty) {
+TEST_F(MatchingEngineTest, SpreadIsInvalidPriceWhenBidSideIsEmpty) {
     Order ask(1, FIRM_A, SIDE::ASK, ORDER_TYPE::LIMIT, 50, 100);
     LOB.submit_order(ask);
     EXPECT_EQ(Price(INVALID_PRICE), LOB.get_bid_ask_spread());
@@ -1182,7 +1370,7 @@ TEST_F(MatchingEngineTest, ComputesPositiveSpreadWithBothSidesResting) {
     EXPECT_EQ(Price(15), LOB.get_bid_ask_spread());
 }
 
-TEST_F(MatchingEngineTest, TreatsAGenuineRestingBidAtPriceZeroAsIfTheBookWereEmpty) {
+TEST_F(MatchingEngineTest, GenuineRestingBidAtPriceZeroIsNotTreatedAsAnEmptyBook) {
     Order ask(1, FIRM_A, SIDE::ASK, ORDER_TYPE::LIMIT, 10, 100);
     Order bid(2, FIRM_B, SIDE::BID, ORDER_TYPE::LIMIT, 0, 100);
     LOB.submit_order(ask);
@@ -1623,6 +1811,98 @@ TEST(NetworkIngressPipelineTest, OutOfRangePriceIsRejectedNotDisconnected) {
     auto goodFrame = BuildOuchEnterOrderFrame(orderToken2, 'S', 25, symbol, 60);
     ASSERT_EQ(static_cast<ssize_t>(goodFrame.size()), send(clientFd, goodFrame.data(), goodFrame.size(), 0));
 
+    OuchOrderCommand valid{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, valid)) << "connection was closed when it shouldn't have been";
+    EXPECT_EQ(CommandType::ENTER_ORDER, valid.type);
+
+    close(clientFd);
+    receiver.stop();
+    gateway.stop();
+}
+
+// Same shape as the out-of-range price test above: an ENTER or REPLACE whose
+// shares are outside OUCH's "> 0 and < 1,000,000" is well-formed but
+// semantically invalid, so it becomes a CommandType::INVALID rather than
+// closing the connection. 1,000,000 is the first invalid value; 999,999 the
+// last valid one.
+TEST(NetworkIngressPipelineTest, OutOfRangeSharesEnterAndReplaceAreRejectedNotDisconnected) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+
+    NetworkConfig config;
+    config.ingressListenPort = 15116;
+    config.multicastIp = "239.255.0.19";
+    config.multicastPort = 25119;
+
+    NetworkGateway<OuchProtocolHandler, OuchOrderCommand> gateway(
+        handler, config, "/tmp/eceo_test_seq_store_zeroqty.dat", 1024);
+    gateway.start();
+
+    SPSCQueue<OuchOrderCommand> inboundQueue;
+    MulticastIngressReceiver<OuchOrderCommand> receiver(inboundQueue, config);
+    receiver.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int clientFd = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(clientFd, 0);
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(config.ingressListenPort);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+    ASSERT_EQ(0, connect(clientFd, (sockaddr*)&serverAddr, sizeof(serverAddr)));
+
+    auto sendFrame = [&](const std::vector<char>& frame) {
+        ASSERT_EQ(static_cast<ssize_t>(frame.size()), send(clientFd, frame.data(), frame.size(), 0));
+    };
+
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+
+    // Zero-share ENTER.
+    sendFrame(BuildOuchEnterOrderFrame("ZEROSHARES001", 'B', 0, symbol, 40));
+    OuchOrderCommand invalidEnter{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, invalidEnter)) << "the zero-share ENTER never arrived";
+    EXPECT_EQ(CommandType::INVALID, invalidEnter.type);
+    EXPECT_EQ(RejectReason::INVALID_QUANTITY, invalidEnter.invalidReason);
+
+    // One past the OUCH limit.
+    sendFrame(BuildOuchEnterOrderFrame("ZEROSHARES00A", 'B', 1'000'000, symbol, 40));
+    OuchOrderCommand tooBig{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, tooBig)) << "the oversized ENTER never arrived";
+    EXPECT_EQ(CommandType::INVALID, tooBig.type);
+    EXPECT_EQ(RejectReason::INVALID_QUANTITY, tooBig.invalidReason);
+
+    // Exactly at the limit is fine.
+    sendFrame(BuildOuchEnterOrderFrame("ZEROSHARES00B", 'B', 999'999, symbol, 40));
+    OuchOrderCommand atLimit{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, atLimit)) << "connection was closed when it shouldn't have been";
+    EXPECT_EQ(CommandType::ENTER_ORDER, atLimit.type);
+    EXPECT_EQ(Quantity(999'999), atLimit.shares);
+
+    // A valid order, so there is something for a REPLACE to target.
+    const char goodToken[14] = "ZEROSHARES002";
+    sendFrame(BuildOuchEnterOrderFrame(goodToken, 'B', 50, symbol, 40));
+    OuchOrderCommand entered{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, entered)) << "connection was closed when it shouldn't have been";
+    ASSERT_EQ(CommandType::ENTER_ORDER, entered.type);
+
+    // Zero-share REPLACE of that order.
+    sendFrame(BuildOuchReplaceOrderFrame(goodToken, "ZEROSHARES003", 0, 45));
+    OuchOrderCommand invalidReplace{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, invalidReplace)) << "the zero-share REPLACE never arrived";
+    EXPECT_EQ(CommandType::INVALID, invalidReplace.type);
+    EXPECT_EQ(RejectReason::INVALID_QUANTITY, invalidReplace.invalidReason);
+
+    // Oversized REPLACE of the same order.
+    sendFrame(BuildOuchReplaceOrderFrame(goodToken, "ZEROSHARES00C", 1'000'000, 45));
+    OuchOrderCommand tooBigReplace{};
+    ASSERT_TRUE(WaitForPop(inboundQueue, tooBigReplace)) << "the oversized REPLACE never arrived";
+    EXPECT_EQ(CommandType::INVALID, tooBigReplace.type);
+    EXPECT_EQ(RejectReason::INVALID_QUANTITY, tooBigReplace.invalidReason);
+
+    // The connection survived all of them.
+    sendFrame(BuildOuchEnterOrderFrame("ZEROSHARES004", 'S', 25, symbol, 60));
     OuchOrderCommand valid{};
     ASSERT_TRUE(WaitForPop(inboundQueue, valid)) << "connection was closed when it shouldn't have been";
     EXPECT_EQ(CommandType::ENTER_ORDER, valid.type);
@@ -2158,16 +2438,15 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     // g_telemetry_arena is one process-wide global shared by every test in
     // this binary, and trace_index(0) is where every directly-constructed
     // MatchingEngineTest Order lands too (m_telemetry_idx defaults to 0
-    // there). The PriceLevelsTouched/RestingOrdersTouched ext_counters can already be
-    // nonzero here from unrelated crossing tests that ran earlier in this
-    // process — snapshot before sending, so the assertions below check what
-    // THIS order's flow actually changed, not an absolute value that would
-    // be flaky depending on test execution order.
+    // there), and NetworkGateway restarts its sequence at 0 in every test, so
+    // earlier tests in this process can leave stale timestamps and counters in
+    // it that would satisfy the assertions below without this test's flow ever
+    // writing them. Nothing of this test's is running against the slot yet
+    // (the client hasn't connected), so start from a clean one.
     OrderTrace& trace = g_telemetry_arena[trace_index(0)];
+    trace = OrderTrace{};
     constexpr auto kPriceLevels = static_cast<size_t>(LobExtSlot::PriceLevelsTouched);
     constexpr auto kRestingOrders = static_cast<size_t>(LobExtSlot::RestingOrdersTouched);
-    const auto priceLevelsBefore = trace.ext_counters[kPriceLevels];
-    const auto restingOrdersBefore = trace.ext_counters[kRestingOrders];
 
     int clientFd = socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(clientFd, 0);
@@ -2207,9 +2486,9 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     EXPECT_NE(0u, trace.match_done_tai_ns) << "MatchingService's post-submit timestamp never made it into the arena";
     EXPECT_GE(trace.match_done_tai_ns, trace.engine_pop_tai_ns)
         << "match_done_tai_ns and engine_pop_tai_ns are both stamped from the same thread in sequence";
-    EXPECT_EQ(priceLevelsBefore, trace.ext_counters[kPriceLevels])
+    EXPECT_EQ(0, trace.ext_counters[kPriceLevels])
         << "a lone order into an empty book never calls walk_price_level";
-    EXPECT_EQ(restingOrdersBefore, trace.ext_counters[kRestingOrders])
+    EXPECT_EQ(0, trace.ext_counters[kRestingOrders])
         << "a lone order into an empty book never calls walk_price_level";
 
     matchingService.stop();

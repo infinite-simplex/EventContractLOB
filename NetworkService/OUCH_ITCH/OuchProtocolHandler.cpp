@@ -72,7 +72,8 @@ namespace {
 //     NetworkGateway closes the connection rather than stalling on bytes
 //     that will never parse.
 //   - Well-formed frame, invalid content (unknown symbol, price outside
-//     [WORST_BID, WORST_ASK]): a real OuchOrderCommand can still be built.
+//     [WORST_BID, WORST_ASK], shares outside (0, MAX_ORDER_QUANTITY] on an
+//     enter/replace): a real OuchOrderCommand can still be built.
 //     Returns totalFrameLen with type = CommandType::INVALID and flows
 //     through the normal OrderBook reject pipeline — same as CANCEL_ORDER's
 //     unknown-token case below, which is accepted, not rejected, at this
@@ -130,6 +131,12 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
             return totalFrameLen;
         }
         outCmd.price = decodedPrice;
+
+        if (!is_valid_order_quantity(outCmd.shares)) { // real OUCH: shares > 0 and < 1,000,000
+            outCmd.type = CommandType::INVALID;
+            outCmd.invalidReason = RejectReason::INVALID_QUANTITY;
+            return totalFrameLen;
+        }
 
         uint32_t timeInForce = readBE32(reinterpret_cast<const char*>(&wire->timeInForce));
         outCmd.orderType = mapTimeInForce(timeInForce);
@@ -196,6 +203,14 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
             return totalFrameLen;
         }
         outCmd.price = decodedPrice;
+
+        // A replace can't resize an order to nothing (that's a cancel), and
+        // is bound by the same upper limit as an enter.
+        if (!is_valid_order_quantity(outCmd.shares)) {
+            outCmd.type = CommandType::INVALID;
+            outCmd.invalidReason = RejectReason::INVALID_QUANTITY;
+            return totalFrameLen;
+        }
 
         // timeInForce/display/intermarketSweep/minimumQuantity are present
         // in the real struct but not read: OrderBook::replace_order never

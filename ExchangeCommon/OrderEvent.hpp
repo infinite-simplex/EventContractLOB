@@ -15,7 +15,7 @@ enum class OrderEventType : uint8_t {
 enum class RejectReason : uint8_t {
     NONE = 0,
     UNKNOWN_ORDER,        // e.g. cancel/replace referenced a bad id
-    INVALID_QUANTITY,
+    INVALID_QUANTITY,     // enter/replace quantity outside (0, MAX_ORDER_QUANTITY] (OUCH: shares > 0 and < 1,000,000)
     SELF_TRADING_PREVENTION,
     INSUFFICIENT_LIQUIDITY,
     PRICE_OUT_OF_RANGE,   // price outside [WORST_BID, WORST_ASK]
