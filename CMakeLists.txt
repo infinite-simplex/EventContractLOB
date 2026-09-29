@@ -12,12 +12,12 @@ find_package(Threads REQUIRED)
 
 include(FetchContent)
 
-# Pinned to main for now; once ToyExchange starts cutting releases, pin to
-# a version tag instead so a Core change can never silently move this repo.
+# Pinned to a ToyExchange release tag so a Core change can never silently move
+# this repo. To pick up newer Core work, cut a new tag there and bump this.
 FetchContent_Declare(
   Core
   GIT_REPOSITORY https://github.com/infinite-simplex/ToyExchange.git
-  GIT_TAG main
+  GIT_TAG v0.1.0
   SOURCE_SUBDIR Core
 )
 FetchContent_MakeAvailable(Core)
