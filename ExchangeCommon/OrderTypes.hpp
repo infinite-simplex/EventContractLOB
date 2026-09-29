@@ -22,3 +22,9 @@ enum class SIDE {
 	ASK,
 	NO_SIDE
 };
+
+// Slot indices into Core's opaque OrderTrace::ext_counters for this product.
+enum class LobExtSlot {
+	PriceLevelsTouched = 0,
+	RestingOrdersTouched = 1
+};

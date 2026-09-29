@@ -2158,14 +2158,16 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     // g_telemetry_arena is one process-wide global shared by every test in
     // this binary, and trace_index(0) is where every directly-constructed
     // MatchingEngineTest Order lands too (m_telemetry_idx defaults to 0
-    // there). price_levels_touched/resting_orders_touched can already be
+    // there). The PriceLevelsTouched/RestingOrdersTouched ext_counters can already be
     // nonzero here from unrelated crossing tests that ran earlier in this
     // process — snapshot before sending, so the assertions below check what
     // THIS order's flow actually changed, not an absolute value that would
     // be flaky depending on test execution order.
     OrderTrace& trace = g_telemetry_arena[trace_index(0)];
-    const auto priceLevelsBefore = trace.price_levels_touched;
-    const auto restingOrdersBefore = trace.resting_orders_touched;
+    constexpr auto kPriceLevels = static_cast<size_t>(LobExtSlot::PriceLevelsTouched);
+    constexpr auto kRestingOrders = static_cast<size_t>(LobExtSlot::RestingOrdersTouched);
+    const auto priceLevelsBefore = trace.ext_counters[kPriceLevels];
+    const auto restingOrdersBefore = trace.ext_counters[kRestingOrders];
 
     int clientFd = socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(clientFd, 0);
@@ -2205,9 +2207,9 @@ TEST(NetworkIngressPipelineTest, TelemetryIsCapturedConsistentlyAcrossStages) {
     EXPECT_NE(0u, trace.match_done_tai_ns) << "MatchingService's post-submit timestamp never made it into the arena";
     EXPECT_GE(trace.match_done_tai_ns, trace.engine_pop_tai_ns)
         << "match_done_tai_ns and engine_pop_tai_ns are both stamped from the same thread in sequence";
-    EXPECT_EQ(priceLevelsBefore, trace.price_levels_touched)
+    EXPECT_EQ(priceLevelsBefore, trace.ext_counters[kPriceLevels])
         << "a lone order into an empty book never calls walk_price_level";
-    EXPECT_EQ(restingOrdersBefore, trace.resting_orders_touched)
+    EXPECT_EQ(restingOrdersBefore, trace.ext_counters[kRestingOrders])
         << "a lone order into an empty book never calls walk_price_level";
 
     matchingService.stop();

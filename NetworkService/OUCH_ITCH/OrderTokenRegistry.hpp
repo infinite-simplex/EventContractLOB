@@ -3,6 +3,7 @@
 #include <cstring>
 #include <memory>
 #include "Alias.hpp"
+#include "EventContractTypes.hpp"
 
 // Network-layer orderToken -> OrderId resolution, structurally identical to
 // SymbolRegistry (fixed bucket array, linear probing, multiplicative hash) —

@@ -14,7 +14,7 @@
 #include "IGoodTillDayScheduler.hpp"
 #include "MarketHours.hpp"
 #include "Telemetry.hpp" // every OrderEvent's .timestamp needs get_synced_time_ns()
-// WORST_ASK / WORST_BID live in ExchangeCommon/Alias.hpp (pulled in
+// WORST_ASK / WORST_BID live in ExchangeCommon/EventContractTypes.hpp (pulled in
 // transitively via OuchOrderCommand.hpp above) — shared with NetworkService's
 // ingress price validation, which must not link MatchingService.
 
@@ -84,10 +84,10 @@ class BookSide {
 public:
     explicit BookSide(std::vector<Order*>& globalOrderLookup, TelemetryPolicy& policy,
                        uint64_t& nextSequenceNumber, ExecutionId& nextMatchId) :
-        m_global_lookup(&globalOrderLookup),
         m_order_pool(std::make_unique<Order[]>(BOOK_POOL_SIZE)),
         m_free_pool(std::make_unique<OrderId[]>(BOOK_POOL_SIZE)),
         m_policy(policy),
+        m_global_lookup(&globalOrderLookup),
         m_next_sequence_number(nextSequenceNumber),
         m_next_match_id(nextMatchId)
     {
@@ -291,10 +291,10 @@ private:
         Quantity takenFromBook{ 0u };
         OrderId curr = priceLevel.m_head;
         OrderTrace& trace = g_telemetry_arena[trace_index(order.m_telemetry_idx)];
-        ++trace.price_levels_touched;
+        ++trace.ext_counters[static_cast<size_t>(LobExtSlot::PriceLevelsTouched)];
         while (curr != INVALID_IDX && order.get_remaining_quantity() > 0u) {
             auto& topOrder = m_order_pool[curr];
-            ++trace.resting_orders_touched;
+            ++trace.ext_counters[static_cast<size_t>(LobExtSlot::RestingOrdersTouched)];
             if (topOrder.get_firm_id() == order.get_firm_id()) {
                 // STP: reject the aggressive (incoming) order, not the resting one
                 m_policy.on_order_event(OrderEvent{

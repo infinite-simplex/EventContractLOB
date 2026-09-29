@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include "Alias.hpp"
+#include "EventContractTypes.hpp"
 #include "OrderEvent.hpp"
 #include "OrderTypes.hpp"
 

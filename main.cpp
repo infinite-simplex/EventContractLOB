@@ -8,11 +8,11 @@
 
 
 // Resets or initializes the generator sequence with a deterministic seed
-inline void SeedRandomOrderGen(uint64_t seed = 1337) {
+inline void SeedRandomOrderGen(uint64_t /*seed*/ = 1337) {
     // Shared helper function or static state resetting mechanism
 }
 
-static Order GetRandomOrder(uint64_t seed = 0) {
+static Order GetRandomOrder(uint64_t /*seed*/ = 0) {
     // Fixed initial seed instead of std::random_device{}()
     static std::mt19937_64 rng(1337);
 
@@ -24,7 +24,7 @@ static Order GetRandomOrder(uint64_t seed = 0) {
     std::uniform_int_distribution<int> side_dist(0, 1); // 0 = BUY, 1 = SELL
     std::uniform_int_distribution<int> type_dist(0, int(ORDER_TYPE::NONE)-1);
     std::uniform_int_distribution<uint16_t> price_dist(0, 101);
-    std::uniform_int_distribution<Quantity> qty_dist(-1, 50000);
+    std::uniform_int_distribution<Quantity> qty_dist(0, 50000);
 
     // Map random ints back to your strong enums
     SIDE side = (side_dist(rng) == 0) ? SIDE::BID : SIDE::ASK;

@@ -1,5 +1,6 @@
 #pragma once
 #include "Alias.hpp"
+#include "EventContractTypes.hpp"
 #include "OrderTypes.hpp"
 
 #define INVALID_PRICE UINT8_MAX
@@ -11,12 +12,12 @@ public:
 
 	Order(OrderId id, FirmId firm_id, SIDE side, ORDER_TYPE type, Price price, Quantity quantity)
 		: m_id(id),
+		m_price(price),
 		m_firm_id(firm_id),
 		m_initial_quantity(quantity),
 		m_remaining_quantity(quantity),
 		m_type(type),
-		m_side(side),
-		m_price(price) {
+		m_side(side) {
 	}
 
 	[[nodiscard]] OrderId get_id() const noexcept { return m_id; }

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include "Alias.hpp"
+#include "EventContractTypes.hpp"
 #include "OrderTypes.hpp" // SIDE
 enum class OrderEventType : uint8_t {
     ACCEPTED,   // OUCH: Order Accepted        — order validated and live
