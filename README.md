@@ -20,7 +20,8 @@ leader publishes), **PerformanceServiceApp** (from ToyExchange — HdrHistogram
 latency percentiles aggregated across replicas). A custom compact frame on
 egress (no public ITCH feed yet).
 
-Design rationale and tradeoffs are written up separately outside this repo.
+Design rationale and tradeoffs are written up in the
+[EventContractLOB design write-up](https://infinite-simplex.github.io/InfiniteLabs/#EventContractLOB).
 
 ## Limits
 
