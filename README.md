@@ -74,6 +74,7 @@ Configure with `-DBUILD_PERFORMANCE_SERVICE=ON`, then:
 Tools/load_test.sh 10000 30 build   # whole stack under OuchLoadGenerator: orders/s, seconds
 build/Tools/OrderBookBench/OrderBookBench   # the book alone: cost per trade against level depth
 Tools/bench_counters.sh 12 build    # what the two telemetry counters cost
+Tools/engine_throughput.sh 30 build # the engine alone: sustained orders/s, no gateway or sockets
 ```
 
 The results, with the machine and the caveats, are on the design write-up.

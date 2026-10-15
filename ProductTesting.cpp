@@ -1104,6 +1104,48 @@ TEST_F(MatchingEngineTest, OrderIdWithoutALookupSlotIsRejectedOnEveryPathAndNeve
     EXPECT_EQ(size_t(1), traces.size());
 }
 
+// Replicas that applied the same commands must hold the same book, and the digest is how that is checked:
+// it covers every resting order in priority order, so it must match for the same input and move for any
+// difference, including which of two orders at one price arrived first.
+TEST_F(MatchingEngineTest, StateDigestMatchesForTheSameOrdersAndMovesForAnyDifference) {
+    std::vector<OrderEvent> otherEvents;
+    std::vector<OrderTrace> otherTraces;
+    TestingPolicy<OrderEvent> otherPolicy{ otherEvents, otherTraces };
+    OrderBook<TestingPolicy<OrderEvent>> other{ otherPolicy };
+    EXPECT_EQ(LOB.state_digest(), other.state_digest()) << "two empty books";
+
+    for (OrderId id = 1; id <= 20; ++id) {
+        const SIDE side = id % 2 ? SIDE::BID : SIDE::ASK;
+        const Price price = side == SIDE::BID ? Price(40 + id % 5) : Price(60 - id % 5);
+        Order a(id, FIRM_A + id, side, ORDER_TYPE::LIMIT, price, static_cast<Quantity>(10 + id));
+        Order b = a;
+        LOB.submit_order(a);
+        other.submit_order(b);
+    }
+    EXPECT_EQ(LOB.state_digest(), other.state_digest());
+
+    Order extra(21, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 41, 5);
+    LOB.submit_order(extra);
+    EXPECT_NE(LOB.state_digest(), other.state_digest()) << "one extra resting order";
+    Order sameExtra(21, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 41, 5);
+    other.submit_order(sameExtra);
+    EXPECT_EQ(LOB.state_digest(), other.state_digest());
+
+    std::vector<OrderEvent> firstEvents, secondEvents;
+    std::vector<OrderTrace> firstTraces, secondTraces;
+    TestingPolicy<OrderEvent> firstPolicy{ firstEvents, firstTraces };
+    TestingPolicy<OrderEvent> secondPolicy{ secondEvents, secondTraces };
+    OrderBook<TestingPolicy<OrderEvent>> first{ firstPolicy };
+    OrderBook<TestingPolicy<OrderEvent>> second{ secondPolicy };
+    Order x1(1, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 50, 10), y1(2, FIRM_B, SIDE::BID, ORDER_TYPE::LIMIT, 50, 10);
+    Order x2 = x1, y2 = y1;
+    first.submit_order(x1);
+    first.submit_order(y1);
+    second.submit_order(y2);
+    second.submit_order(x2);
+    EXPECT_NE(first.state_digest(), second.state_digest()) << "the same two orders in the other arrival order";
+}
+
 // A side holds BOOK_POOL_SIZE resting orders. The order after that used to throw out of the matching
 // thread; it is now rejected, and only the part that would have rested.
 TEST_F(MatchingEngineTest, FullBookSideRejectsWhatCannotRestInsteadOfThrowing) {

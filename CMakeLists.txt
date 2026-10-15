@@ -28,6 +28,7 @@ add_subdirectory(NetworkService)
 add_subdirectory(Tools/OuchTestClient)
 add_subdirectory(Tools/OuchLoadGenerator)
 add_subdirectory(Tools/OrderBookBench)
+add_subdirectory(Tools/EngineThroughput)
 
 # Core's PerformanceServiceApp (percentiles of the telemetry the replicas forward). Core's
 # own CMake builds it, but only the Core/ subdirectory is configured here, so it is opt-in:

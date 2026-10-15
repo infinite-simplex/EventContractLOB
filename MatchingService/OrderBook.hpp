@@ -98,6 +98,21 @@ public:
 
     [[nodiscard]] Quantity get_resting_quantity() const noexcept { return m_quantity; }
 
+    // Folds every resting order into a running FNV-1a hash, in price then time priority.
+    [[nodiscard]] std::uint64_t digest(std::uint64_t hash) const noexcept {
+        auto mix = [&hash](std::uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
+        for (std::size_t p = 0; p < MAX_LEVELS; ++p) {
+            for (PoolIdx curr = m_price_levels[p].m_head; curr != INVALID_IDX; curr = m_order_pool[curr].m_next_idx) {
+                const Order& order = m_order_pool[curr];
+                mix(order.get_id());
+                mix(p);
+                mix(order.get_remaining_quantity());
+                mix(order.get_firm_id());
+            }
+        }
+        return hash;
+    }
+
     [[nodiscard]] Quantity get_quantity_at_or_better(Price price) {
         Quantity cumulativeQuantity{ 0 };
         if constexpr (BookSideType == SIDE::ASK) {
@@ -525,6 +540,18 @@ public:
         if (order.get_type() != ORDER_TYPE::CANCEL && !exists(order.get_id())) {
             complete_trace(m_telemetry_policy, order.m_telemetry_idx);
         }
+    }
+
+    // A hash of everything that makes two replicas' books the same: every resting order in priority
+    // order on both sides, and the counters that number the events and trades they have emitted.
+    // Not safe to call while another thread is submitting orders.
+    [[nodiscard]] std::uint64_t state_digest() const noexcept {
+        std::uint64_t hash = 14695981039346656037ull;
+        hash = m_bid_book.digest(hash);
+        hash = (hash ^ 0xFFull) * 1099511628211ull;
+        hash = m_ask_book.digest(hash);
+        hash = (hash ^ m_next_sequence_number) * 1099511628211ull;
+        return (hash ^ m_next_match_id) * 1099511628211ull;
     }
 
     Price get_best_bid() const { return m_bid_book.get_best_price(); }

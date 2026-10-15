@@ -133,6 +133,7 @@ int main(int argc, char** argv) {
                       << " best ask=" << static_cast<int>(book.get_best_ask())
                       << " leader=" << (heartbeatClient.isLeader() ? "yes" : "no")
                       << " epoch=" << heartbeatClient.currentEpoch()
+                      << " applied=" << matcher.lastAppliedSeq()
                       << " telemetry_collisions=" << g_telemetry_arena_collisions.load(std::memory_order_relaxed)
                       << "\n";
         }
@@ -156,6 +157,8 @@ int main(int argc, char** argv) {
     // egressPublisher is still alive to drain anything matcher's thread is
     // mid-push on, so it always finishes and matcher.stop() always returns.
     matcher.stop();
+    std::cout << "[" << replicaId << "] final applied=" << matcher.lastAppliedSeq()
+              << " book_digest=" << std::hex << book.state_digest() << std::dec << "\n";
     telemetryForwarder.stop();
     egressPublisher.stop();
     gtdCancelService.stop();

@@ -42,9 +42,11 @@ trap cleanup EXIT
 "$NET_BIN" --sequence-store "$WORKDIR/sequence_store.dat" --symbol TEST > "$WORKDIR/network.log" 2>&1 &
 PIDS+=("$!")
 sleep 0.3
+REPLICA_PIDS=()
 for i in 1 2; do
-    "$MATCH_BIN" --id "replica-$i" --replica-id "$i" --stats-interval-ms 1000 > "$WORKDIR/replica-$i.log" 2>&1 &
+    "$MATCH_BIN" --id "replica-$i" --replica-id "$i" --stats-interval-ms 500 > "$WORKDIR/replica-$i.log" 2>&1 &
     PIDS+=("$!")
+    REPLICA_PIDS+=("$!")
 done
 "$PERF_BIN" --window-ms 1000 > "$WORKDIR/performance.log" 2>&1 &
 PIDS+=("$!")
@@ -59,12 +61,32 @@ done
 
 echo "Workdir: $WORKDIR"
 "$GEN_BIN" --rate "$RATE" --duration-s "$SECONDS_RUN" --seed 1337 | tee "$WORKDIR/generator.txt"
-sleep 2.5
 
+# Wait until both replicas have applied the same sequence number and it has stopped moving for 3 s
+# (they catch up after the load, through the gateway's retransmit server), at most 3 minutes.
+applied() { grep -o 'applied=[0-9]*' "$WORKDIR/replica-$1.log" | tail -1 | cut -d= -f2; }
+stable=0
+for _ in $(seq 1 360); do
+    sleep 0.5
+    now="$(applied 1)/$(applied 2)"
+    if [ "$now" = "${last:-}" ] && [ "$(applied 1)" = "$(applied 2)" ]; then stable=$((stable + 1)); else stable=0; fi
+    last="$now"
+    [ "$stable" -ge 6 ] && break
+done
+
+# A graceful stop makes each replica print its final sequence number and a digest of its whole book.
+kill -TERM "${REPLICA_PIDS[@]}" 2>/dev/null
+wait "${REPLICA_PIDS[@]}" 2>/dev/null
 echo
 for i in 1 2; do
-    echo "replica-$i final stats: $(grep -E 'telemetry_collisions' "$WORKDIR/replica-$i.log" | tail -1)"
+    echo "replica-$i $(grep -o 'final applied=.*' "$WORKDIR/replica-$i.log" | tail -1)   (sequence gaps recovered: $(grep -c 'Sequence gap' "$WORKDIR/replica-$i.log"), leader changes: $(( $(grep -o 'epoch=[0-9]*' "$WORKDIR/replica-$i.log" | cut -d= -f2 | sort -n | tail -1) - 1 )))"
 done
+if [ "$(grep -o 'final applied=.*' "$WORKDIR/replica-1.log" | tail -1)" = "$(grep -o 'final applied=.*' "$WORKDIR/replica-2.log" | tail -1)" ] \
+    && grep -q 'final applied=' "$WORKDIR/replica-1.log"; then
+    echo "replicas: IDENTICAL books"
+else
+    echo "replicas: DIFFERENT books (or a replica did not stop cleanly)"
+fi
 echo
 
 python3 - "$WORKDIR/performance.log" "$WORKDIR/generator.txt" <<'PYEOF'
