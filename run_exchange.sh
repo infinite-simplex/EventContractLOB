@@ -26,12 +26,19 @@ MATCH_BIN="$BUILD_DIR/MatchingService/MatchingServiceApp"
 PERF_BIN="$BUILD_DIR/PerformanceService/PerformanceServiceApp"
 CLIENT_BIN="$BUILD_DIR/Tools/OuchTestClient/OuchTestClient"
 
-for bin in "$NET_BIN" "$MATCH_BIN" "$PERF_BIN"; do
+for bin in "$NET_BIN" "$MATCH_BIN"; do
     if [ ! -x "$bin" ]; then
-        echo "Missing binary: $bin (build NetworkServiceApp, MatchingServiceApp, PerformanceServiceApp first)" >&2
+        echo "Missing binary: $bin (build NetworkServiceApp and MatchingServiceApp first)" >&2
         exit 1
     fi
 done
+
+# PerformanceServiceApp is opt-in at build time, so the exchange runs without it.
+HAVE_PERF=1
+if [ ! -x "$PERF_BIN" ]; then
+    HAVE_PERF=0
+    echo "Note: $PERF_BIN is not built, so no latency percentiles. Configure with -DBUILD_PERFORMANCE_SERVICE=ON to get them." >&2
+fi
 
 RUN_DIR="run"
 rm -rf "$RUN_DIR"
@@ -68,8 +75,10 @@ for i in $(seq 1 "$NUM_REPLICAS"); do
     PIDS+=("$!")
 done
 
-"$PERF_BIN" --window-ms 1000 > "$PERF_LOG" 2>&1 &
-PIDS+=("$!")
+if [ "$HAVE_PERF" -eq 1 ]; then
+    "$PERF_BIN" --window-ms 1000 > "$PERF_LOG" 2>&1 &
+    PIDS+=("$!")
+fi
 
 # Let heartbeats establish an initial leader and confirm nothing crashed
 # immediately (bad port, missing binary, etc.) before printing "ready".
@@ -88,12 +97,16 @@ echo "  NetworkServiceApp   -> $NET_LOG   (OUCH order entry on :10001)"
 for i in $(seq 1 "$NUM_REPLICAS"); do
     echo "  replica-$i            -> $RUN_DIR/replica-$i.log"
 done
-echo "  PerformanceService  -> $PERF_LOG   (percentiles dumped every 1s)"
+if [ "$HAVE_PERF" -eq 1 ]; then
+    echo "  PerformanceService  -> $PERF_LOG   (percentiles dumped every 1s)"
+fi
 echo
 echo "Send orders with, e.g.:"
 echo "  $CLIENT_BIN --side B --price 50 --qty 10 --firm-id 1"
 echo
-echo "Watch metrics live with:  tail -f $PERF_LOG"
+if [ "$HAVE_PERF" -eq 1 ]; then
+    echo "Watch metrics live with:  tail -f $PERF_LOG"
+fi
 echo "Test failover with:       ./kill_leader.sh $RUN_DIR   (kills just the current leader)"
 echo "Press Ctrl+C to stop everything."
 

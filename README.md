@@ -16,9 +16,10 @@ This is a portfolio project, not a production exchange.
 Three processes: **NetworkServiceApp** (gateway — OUCH ingress, sequencing,
 durable log with gap-fill retransmit, leader arbitration, egress),
 **MatchingServiceApp** (N replicas of the matching engine, only the elected
-leader publishes), **PerformanceServiceApp** (from ToyExchange — HdrHistogram
-latency percentiles aggregated across replicas). A custom compact frame on
-egress (no public ITCH feed yet).
+leader publishes), and optionally **PerformanceServiceApp** (from ToyExchange —
+HdrHistogram latency percentiles aggregated across replicas; build it with
+`-DBUILD_PERFORMANCE_SERVICE=ON`, which fetches HdrHistogram_c). A custom compact
+frame on egress (no public ITCH feed yet).
 
 Design rationale and tradeoffs are written up in the
 [EventContractLOB design write-up](https://infinite-simplex.github.io/InfiniteLabs/#EventContractLOB).
@@ -62,8 +63,20 @@ build/Tools/OuchTestClient/OuchTestClient --side S --price 50 --qty 10 --firm-id
 ```
 
 `./kill_leader.sh run` kills only the current leader replica, to watch
-failover happen live. `tail -f run/performance.log` shows latency
-percentiles.
+failover happen live. With the performance service built, `tail -f
+run/performance.log` shows latency percentiles.
+
+## Measuring
+
+Configure with `-DBUILD_PERFORMANCE_SERVICE=ON`, then:
+
+```bash
+Tools/load_test.sh 10000 30 build   # whole stack under OuchLoadGenerator: orders/s, seconds
+build/Tools/OrderBookBench/OrderBookBench   # the book alone: cost per trade against level depth
+Tools/bench_counters.sh 12 build    # what the two telemetry counters cost
+```
+
+The results, with the machine and the caveats, are on the design write-up.
 
 ## Testing
 

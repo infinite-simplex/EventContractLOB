@@ -32,7 +32,5 @@ compile_commands.json
 .claude/
 
 # Ad hoc local run artifacts
-log.txt
-latencies.txt
 *.dat
 /run/

@@ -2,12 +2,9 @@
 // OUCH TCP listener and sends one or more ENTER_ORDER frames. Deliberately
 // decoupled from NetworkService/MatchingService internal types (it's meant
 // to simulate an external client, not reuse OuchOrderCommand) — the frame
-// layout is duplicated here, hand-matched to the real, byte-accurate NASDAQ
-// OUCH 4.2 structs in NetworkService/OUCH_ITCH/OUCH.hpp (not included
-// directly, per this file's own decoupling — see OuchProtocolHandler.cpp
-// for the parser that decodes these same bytes), the same layout
-// Testing.cpp's BuildOuchEnterOrderFrame helper builds for the ingress
-// pipeline tests.
+// builders are in ../OuchFrames.hpp, hand-matched to the real, byte-accurate
+// NASDAQ OUCH 4.2 structs in NetworkService/OUCH_ITCH/OUCH.hpp (see
+// OuchProtocolHandler.cpp for the parser that decodes these same bytes).
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -22,139 +19,16 @@
 #include <thread>
 #include <vector>
 
+#include "../OuchFrames.hpp"
+
 namespace {
-
-// Real OUCH 4.2 OUCHEnterOrder body (see OUCH.hpp), wrapped in this
-// project's own [2B BE payloadLen] envelope: [1B 'O'][14B token][1B side]
-// [4B BE shares][8B symbol][4B BE price][4B BE timeInForce][4B BE mpid]
-// [1B display][1B capacity][1B intermarketSweep][4B BE minimumQuantity]
-// [1B crossType][1B customerType]. `price` here is in whole cents (this
-// exchange's own Price domain, 0-100); converted to OUCH's real fixed-point
-// wire convention (dollars * 10000) the same way OuchProtocolHandler
-// decodes it back — see decodePrice() there.
-std::vector<char> BuildOuchEnterOrderFrame(const char orderToken[14], char buySellIndicator,
-    uint32_t shares, const char symbol[8], uint32_t price, uint32_t timeInForce, uint32_t firmId) {
-    constexpr size_t bodyLen = 14 + 1 + 4 + 8 + 4 + 4 + 4 + 1 + 1 + 1 + 4 + 1 + 1;
-    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
-    uint32_t wirePrice = price * 100; // cents -> OUCH's dollars*10000 fixed point
-
-    std::vector<char> frame(2 + payloadLen, '\0');
-    size_t off = 0;
-    frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(payloadLen & 0xFF);
-    frame[off++] = 'O';
-    std::memcpy(frame.data() + off, orderToken, 14); off += 14;
-    frame[off++] = buySellIndicator;
-    frame[off++] = static_cast<char>((shares >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(shares & 0xFF);
-    std::memcpy(frame.data() + off, symbol, 8); off += 8;
-    frame[off++] = static_cast<char>((wirePrice >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((wirePrice >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((wirePrice >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(wirePrice & 0xFF);
-    frame[off++] = static_cast<char>((timeInForce >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((timeInForce >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((timeInForce >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(timeInForce & 0xFF);
-    frame[off++] = static_cast<char>((firmId >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((firmId >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((firmId >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(firmId & 0xFF);
-    // display / capacity / intermarketSweep / minimumQuantity / crossType /
-    // customerType: real OUCH fields OuchProtocolHandler parses but doesn't
-    // act on yet — neutral placeholder values.
-    frame[off++] = 'N'; // display
-    frame[off++] = 'O'; // capacity
-    frame[off++] = 'N'; // intermarketSweep
-    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; // minimumQuantity
-    frame[off++] = 'N'; // crossType
-    frame[off++] = ' '; // customerType
-    return frame;
-}
-
-// Real OUCH 4.2 OUCHReplaceOrder body (see OUCH.hpp): [1B 'U']
-// [14B existingToken][14B newToken][4B BE shares][4B BE price]
-// [4B BE timeInForce][1B display][1B intermarketSweep][4B BE minimumQuantity].
-// Two tokens (the order being replaced, and the new one identifying the
-// result), not one token reused — a token identifies one specific order
-// instance. `price` is in whole cents, same convention as
-// BuildOuchEnterOrderFrame above.
-std::vector<char> BuildOuchReplaceOrderFrame(const char existingToken[14], const char newToken[14],
-    uint32_t shares, uint32_t price) {
-    constexpr size_t bodyLen = 14 + 14 + 4 + 4 + 4 + 1 + 1 + 4;
-    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
-    uint32_t wirePrice = price * 100;
-
-    std::vector<char> frame(2 + payloadLen, '\0');
-    size_t off = 0;
-    frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(payloadLen & 0xFF);
-    frame[off++] = 'U';
-    std::memcpy(frame.data() + off, existingToken, 14); off += 14;
-    std::memcpy(frame.data() + off, newToken, 14); off += 14;
-    frame[off++] = static_cast<char>((shares >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(shares & 0xFF);
-    frame[off++] = static_cast<char>((wirePrice >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((wirePrice >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((wirePrice >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(wirePrice & 0xFF);
-    // timeInForce / display / intermarketSweep / minimumQuantity: real OUCH
-    // fields OuchProtocolHandler parses but discards for REPLACE_ORDER —
-    // left zero/neutral.
-    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; // timeInForce
-    frame[off++] = 'N'; // display
-    frame[off++] = 'N'; // intermarketSweep
-    frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; frame[off++] = 0; // minimumQuantity
-    return frame;
-}
-
-// [2B BE payloadLen]['X'][14B token][4B BE shares]
-std::vector<char> BuildOuchCancelOrderFrame(const char orderToken[14], uint32_t shares) {
-    constexpr size_t bodyLen = 14 + 4;
-    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
-
-    std::vector<char> frame(2 + payloadLen);
-    size_t off = 0;
-    frame[off++] = static_cast<char>((payloadLen >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(payloadLen & 0xFF);
-    frame[off++] = 'X';
-    std::memcpy(frame.data() + off, orderToken, 14); off += 14;
-    frame[off++] = static_cast<char>((shares >> 24) & 0xFF);
-    frame[off++] = static_cast<char>((shares >> 16) & 0xFF);
-    frame[off++] = static_cast<char>((shares >> 8) & 0xFF);
-    frame[off++] = static_cast<char>(shares & 0xFF);
-    return frame;
-}
-
-void PadSymbol(char out[8], const std::string& symbol) {
-    std::memset(out, ' ', 8);
-    std::memcpy(out, symbol.data(), std::min<size_t>(symbol.size(), 8));
-}
+using namespace ouchframes;
 
 // 14-byte order token, unique per call within a process run.
 void MakeToken(char out[14], uint32_t counter) {
     std::memset(out, ' ', 14);
     std::string text = "T" + std::to_string(counter);
     std::memcpy(out, text.data(), std::min<size_t>(text.size(), 14));
-}
-
-uint16_t ReadBE16(const char* p) {
-    return (static_cast<uint8_t>(p[0]) << 8) | static_cast<uint8_t>(p[1]);
-}
-uint32_t ReadBE32(const char* p) {
-    return (static_cast<uint32_t>(static_cast<uint8_t>(p[0])) << 24)
-        | (static_cast<uint32_t>(static_cast<uint8_t>(p[1])) << 16)
-        | (static_cast<uint32_t>(static_cast<uint8_t>(p[2])) << 8)
-        | static_cast<uint32_t>(static_cast<uint8_t>(p[3]));
-}
-uint64_t ReadBE64(const char* p) {
-    uint64_t v = 0;
-    for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<uint8_t>(p[i]);
-    return v;
 }
 
 // Decodes the egress frame NetworkService/OrderEventFrame.hpp encodes:

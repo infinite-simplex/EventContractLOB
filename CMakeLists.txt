@@ -26,16 +26,24 @@ add_subdirectory(ExchangeCommon)
 add_subdirectory(MatchingService)
 add_subdirectory(NetworkService)
 add_subdirectory(Tools/OuchTestClient)
+add_subdirectory(Tools/OuchLoadGenerator)
+add_subdirectory(Tools/OrderBookBench)
 
-add_executable(ExchangeMain main.cpp)
-target_link_libraries(ExchangeMain
-    PRIVATE
-        NetworkService
-        MatchingService
-        ExchangeCommon
-        Core
-        Threads::Threads
-)
+# Core's PerformanceServiceApp (percentiles of the telemetry the replicas forward). Core's
+# own CMake builds it, but only the Core/ subdirectory is configured here, so it is opt-in:
+# it needs HdrHistogram_c, which is fetched when this is ON.
+option(BUILD_PERFORMANCE_SERVICE "Build Core's PerformanceServiceApp (fetches HdrHistogram_c)" OFF)
+if(BUILD_PERFORMANCE_SERVICE)
+  FetchContent_Declare(
+    hdr_histogram
+    URL https://github.com/HdrHistogram/HdrHistogram_c/archive/refs/tags/0.11.10.zip
+  )
+  set(HDR_LOG_REQUIRED "DISABLED" CACHE STRING "" FORCE)
+  set(HDR_HISTOGRAM_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+  set(HDR_HISTOGRAM_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(hdr_histogram)
+  add_subdirectory(${core_SOURCE_DIR}/PerformanceService PerformanceService)
+endif()
 
 enable_testing()
 
