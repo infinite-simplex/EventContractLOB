@@ -55,6 +55,10 @@ cmake --build build -j"$(nproc)"
 ./run_exchange.sh 2 build
 ```
 
+Core asks for 4 MB UDP receive buffers. If `net.core.rmem_max` is lower, the receivers print a
+warning at start-up and a burst can drop datagrams (retransmit recovers them, at a cost);
+`sudo sysctl -w net.core.rmem_max=4194304` removes it.
+
 Then, from another shell:
 
 ```bash
