@@ -34,7 +34,12 @@ Design rationale and tradeoffs are written up in the
   `INVALID_QUANTITY`. A cancel's `shares = 0` still means "cancel all
   remaining".
 
-Both checks run in the OUCH handler (a bad frame becomes a rejected command
+- **Book depth:** 262,144 resting orders per side. Past that, the part of an order
+  that would rest is rejected with `BOOK_FULL`; fills it already made stand.
+- **Order ids:** 10,000,000 per run (one counter, never reset). After that every
+  enter and replace is rejected with `ORDER_LIMIT_REACHED`.
+
+Every check above runs in the OUCH handler (a bad frame becomes a rejected command
 without dropping the connection) and again in the book, so nothing that
 bypasses the handler can rest an out-of-range order.
 

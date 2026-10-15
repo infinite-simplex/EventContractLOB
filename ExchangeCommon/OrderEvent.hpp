@@ -20,6 +20,8 @@ enum class RejectReason : uint8_t {
     INSUFFICIENT_LIQUIDITY,
     PRICE_OUT_OF_RANGE,   // price outside [WORST_BID, WORST_ASK]
     UNKNOWN_SYMBOL,       // ENTER_ORDER named a symbol SymbolRegistry never registered
+    ORDER_LIMIT_REACHED,  // every order id below ORDER_ID_LIMIT has been used
+    BOOK_FULL,            // that side of the book has no free slot for the part of the order that would rest
 };
 
 struct OrderEvent {

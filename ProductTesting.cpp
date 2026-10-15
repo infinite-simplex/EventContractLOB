@@ -1066,6 +1066,93 @@ TEST_F(MatchingEngineTest, ReplaceWithOutOfRangePriceIsRejected) {
     EXPECT_EQ(Quantity(100), LOB.get_bid_quantity());
 }
 
+// The lookup table has one slot per id below ORDER_ID_LIMIT and the insert path writes it
+// unchecked, so an id past the end has to be refused on every way in, before anything rests.
+TEST_F(MatchingEngineTest, OrderIdWithoutALookupSlotIsRejectedOnEveryPathAndNeverRests) {
+    auto lastSlot = make_enter_order_command(ORDER_ID_LIMIT - 1, "ID-LIMIT00001", 'B', 100, 50, ORDER_TYPE::LIMIT);
+    LOB.submit_order(lastSlot);
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::ACCEPTED, events[0].type) << "the last id with a slot still rests";
+    events.clear();
+    traces.clear();
+
+    auto pastEnd = make_enter_order_command(ORDER_ID_LIMIT, "ID-LIMIT00002", 'B', 100, 51, ORDER_TYPE::LIMIT);
+    LOB.submit_order(pastEnd);
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::REJECTED, events[0].type);
+    EXPECT_EQ(RejectReason::ORDER_LIMIT_REACHED, events[0].reject_reason);
+    EXPECT_EQ(Price(50), LOB.get_best_bid());
+    EXPECT_EQ(Quantity(100), LOB.get_bid_quantity());
+    EXPECT_EQ(size_t(1), traces.size()) << "no order ever rested, so submit_order must complete the trace";
+    events.clear();
+    traces.clear();
+
+    Order viaOrder(ORDER_ID_LIMIT + 5, FIRM_A, SIDE::ASK, ORDER_TYPE::LIMIT, 70, 10);
+    LOB.submit_order(viaOrder);
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(RejectReason::ORDER_LIMIT_REACHED, events[0].reject_reason);
+    EXPECT_EQ(Quantity(0), LOB.get_ask_quantity());
+    events.clear();
+    traces.clear();
+
+    auto replace = make_replace_order_command(ORDER_ID_LIMIT - 1, ORDER_ID_LIMIT, "ID-LIMIT00003", 100, 60);
+    LOB.submit_order(replace);
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(RejectReason::ORDER_LIMIT_REACHED, events[0].reject_reason);
+    EXPECT_EQ(Price(50), LOB.get_best_bid()) << "the original order must be untouched by a rejected replace";
+    EXPECT_EQ(Quantity(100), LOB.get_bid_quantity());
+    EXPECT_EQ(size_t(1), traces.size());
+}
+
+// A side holds BOOK_POOL_SIZE resting orders. The order after that used to throw out of the matching
+// thread; it is now rejected, and only the part that would have rested.
+TEST_F(MatchingEngineTest, FullBookSideRejectsWhatCannotRestInsteadOfThrowing) {
+    for (OrderId id = 1; id <= BOOK_POOL_SIZE; ++id) {
+        Order bid(id, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 50, 1);
+        LOB.submit_order(bid);
+    }
+    ASSERT_EQ(Quantity(BOOK_POOL_SIZE), LOB.get_bid_quantity());
+    events.clear();
+    traces.clear();
+
+    Order overflow(BOOK_POOL_SIZE + 1, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 50, 7);
+    ASSERT_NO_THROW(LOB.submit_order(overflow));
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::REJECTED, events[0].type);
+    EXPECT_EQ(RejectReason::BOOK_FULL, events[0].reject_reason);
+    EXPECT_EQ(Quantity(7), events[0].quantity);
+    EXPECT_EQ(Quantity(BOOK_POOL_SIZE), LOB.get_bid_quantity()) << "the rejected order must not rest";
+    EXPECT_EQ(size_t(1), traces.size());
+
+    // The other side is unaffected, and a bid that trades first keeps its fills: only the rest is rejected.
+    Order restingAsk(BOOK_POOL_SIZE + 2, FIRM_B, SIDE::ASK, ORDER_TYPE::LIMIT, 60, 10);
+    LOB.submit_order(restingAsk);
+    EXPECT_EQ(Quantity(10), LOB.get_ask_quantity());
+    events.clear();
+    traces.clear();
+
+    Order partlyFilled(BOOK_POOL_SIZE + 3, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 60, 25);
+    ASSERT_NO_THROW(LOB.submit_order(partlyFilled));
+    ASSERT_FALSE(events.empty());
+    EXPECT_EQ(OrderEventType::REJECTED, events.back().type);
+    EXPECT_EQ(RejectReason::BOOK_FULL, events.back().reject_reason);
+    EXPECT_EQ(Quantity(15), events.back().quantity) << "only the 15 that could not trade or rest";
+    EXPECT_EQ(size_t(2), events.size() - 1) << "the two legs of the 10-share trade stand";
+    EXPECT_EQ(Quantity(0), LOB.get_ask_quantity());
+    EXPECT_EQ(Quantity(BOOK_POOL_SIZE), LOB.get_bid_quantity());
+    events.clear();
+
+    // Cancelling one frees a slot, and the next bid rests again.
+    Order cancel(1, FIRM_A, SIDE::BID, ORDER_TYPE::CANCEL, 0, 0);
+    LOB.submit_order(cancel);
+    events.clear();
+    Order again(BOOK_POOL_SIZE + 4, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 50, 3);
+    LOB.submit_order(again);
+    ASSERT_EQ(size_t(1), events.size());
+    EXPECT_EQ(OrderEventType::ACCEPTED, events[0].type);
+    EXPECT_EQ(Quantity(BOOK_POOL_SIZE - 1 + 3), LOB.get_bid_quantity());
+}
+
 // =====================================================================
 // CANCEL_ORDER (via OuchOrderCommand) — the CANCEL tests earlier in this
 // file exercise OrderBook::cancel semantics through the Order-based
@@ -1910,6 +1997,41 @@ TEST(NetworkIngressPipelineTest, OutOfRangeSharesEnterAndReplaceAreRejectedNotDi
     close(clientFd);
     receiver.stop();
     gateway.stop();
+}
+
+// The handler mints one id per enter and per replace. At ORDER_ID_LIMIT it must reject instead,
+// without registering the token, and a rejected replace must leave the old token resolving.
+TEST(NetworkIngressPipelineTest, HandlerRejectsInsteadOfMintingAnIdAtTheOrderIdLimit) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry;
+    OuchProtocolHandler handler(registry, orderTokenRegistry, ORDER_ID_LIMIT - 2);
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+
+    const auto parse = [&](const std::vector<char>& frame) {
+        OuchOrderCommand cmd{};
+        EXPECT_EQ(frame.size(), handler.validateAndParse(frame.data(), frame.size(), cmd));
+        return cmd;
+    };
+
+    const char tokens[4][14] = { "ID-LIMIT00001", "ID-LIMIT00002", "ID-LIMIT00003", "ID-LIMIT00004" };
+    const auto first = parse(BuildOuchEnterOrderFrame(tokens[0], 'B', 10, symbol, 40));
+    EXPECT_EQ(CommandType::ENTER_ORDER, first.type);
+    EXPECT_EQ(ORDER_ID_LIMIT - 2, first.orderId);
+    const auto second = parse(BuildOuchEnterOrderFrame(tokens[1], 'B', 10, symbol, 40));
+    EXPECT_EQ(CommandType::ENTER_ORDER, second.type);
+    EXPECT_EQ(ORDER_ID_LIMIT - 1, second.orderId) << "the last id with a slot is still minted";
+
+    const auto third = parse(BuildOuchEnterOrderFrame(tokens[2], 'B', 10, symbol, 40));
+    EXPECT_EQ(CommandType::INVALID, third.type);
+    EXPECT_EQ(RejectReason::ORDER_LIMIT_REACHED, third.invalidReason);
+    EXPECT_EQ(INVALID_ORDER_ID, orderTokenRegistry.resolve(tokens[2])) << "a rejected enter registers no token";
+
+    const auto replace = parse(BuildOuchReplaceOrderFrame(tokens[1], tokens[3], 10, 45));
+    EXPECT_EQ(CommandType::INVALID, replace.type);
+    EXPECT_EQ(RejectReason::ORDER_LIMIT_REACHED, replace.invalidReason);
+    EXPECT_EQ(INVALID_ORDER_ID, orderTokenRegistry.resolve(tokens[3])) << "a rejected replace registers no new token";
+    EXPECT_EQ(ORDER_ID_LIMIT - 1, orderTokenRegistry.resolve(tokens[1])) << "and the old token still resolves";
 }
 
 // Builds a real OUCHEnterOrder frame with the price field set to a raw

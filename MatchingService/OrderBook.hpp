@@ -18,7 +18,7 @@
 // transitively via OuchOrderCommand.hpp above) — shared with NetworkService's
 // ingress price validation, which must not link MatchingService.
 
-static constexpr std::size_t MAX_GLOBAL_ORDERS = 10'000'000u;
+static constexpr std::size_t MAX_GLOBAL_ORDERS = ORDER_ID_LIMIT;
 static constexpr std::size_t MAX_LEVELS = 101u; // [0, 100] inclusive
 static constexpr std::size_t BOOK_POOL_SIZE = 262'144u;
 
@@ -99,7 +99,6 @@ public:
     [[nodiscard]] Quantity get_resting_quantity() const noexcept { return m_quantity; }
 
     [[nodiscard]] Quantity get_quantity_at_or_better(Price price) {
-        //TODO: Investigate simd
         Quantity cumulativeQuantity{ 0 };
         if constexpr (BookSideType == SIDE::ASK) {
             for (Price p{ price }; p > WORST_BID; --p) {
@@ -156,12 +155,15 @@ public:
     }
 
     
+    [[nodiscard]] bool has_free_slot() const noexcept { return m_free_top != 0; }
+
+    // The caller checks has_free_slot() first and rejects what cannot rest.
     void insert_order(Order& order, OrderEventType eventType = OrderEventType::ACCEPTED) {
         Price p = order.get_price();
         auto& priceLevel = m_price_levels[p];
 
         if (m_free_top == 0) {
-            throw std::runtime_error("Order pool capacity exceeded!");
+            throw std::logic_error("insert_order without a free pool slot");
         }
 
         OrderId free_slot = m_free_pool[--m_free_top];
@@ -465,7 +467,15 @@ public:
         // CANCEL_ORDER's shares is "cancel all remaining" when 0, so it's the
         // one command type where a zero quantity is meaningful.
         if (cmd.type != CommandType::CANCEL_ORDER && !is_valid_order_quantity(cmd.shares)) {
-            reject_invalid_quantity(cmd.orderId, 0, cmd.sessionId,
+            reject_order(RejectReason::INVALID_QUANTITY, cmd.orderId, 0, cmd.sessionId,
+                cmd.buySellIndicator == 'B' ? SIDE::BID : SIDE::ASK, cmd.price, cmd.shares);
+            complete_trace(m_telemetry_policy, cmd.trace_id);
+            return;
+        }
+
+        // insert_order writes the lookup table without a bounds check, so an id it has no slot for stops here.
+        if (cmd.type != CommandType::CANCEL_ORDER && cmd.orderId >= MAX_GLOBAL_ORDERS) {
+            reject_order(RejectReason::ORDER_LIMIT_REACHED, cmd.orderId, 0, cmd.sessionId,
                 cmd.buySellIndicator == 'B' ? SIDE::BID : SIDE::ASK, cmd.price, cmd.shares);
             complete_trace(m_telemetry_policy, cmd.trace_id);
             return;
@@ -486,7 +496,7 @@ public:
             complete_trace(m_telemetry_policy, cmd.trace_id);
         }
 
-        if (m_gtd_scheduler && cmd.orderType == ORDER_TYPE::GOOD_TILL_DAY && !local_order.is_filled()) {
+        if (m_gtd_scheduler && cmd.orderType == ORDER_TYPE::GOOD_TILL_DAY && exists(local_order.get_id())) {
             m_gtd_scheduler->schedule_cancel(cmd.orderToken, today_4pm_est_utc());
         }
     }
@@ -494,7 +504,14 @@ public:
 
     void submit_order(Order& order) {
         if (order.get_type() != ORDER_TYPE::CANCEL && !is_valid_order_quantity(order.get_initial_quantity())) {
-            reject_invalid_quantity(order.get_id(), order.get_firm_id(), order.m_session_id,
+            reject_order(RejectReason::INVALID_QUANTITY, order.get_id(), order.get_firm_id(), order.m_session_id,
+                order.get_side(), order.get_price(), order.get_initial_quantity());
+            complete_trace(m_telemetry_policy, order.m_telemetry_idx);
+            return;
+        }
+
+        if (order.get_type() != ORDER_TYPE::CANCEL && order.get_id() >= MAX_GLOBAL_ORDERS) {
+            reject_order(RejectReason::ORDER_LIMIT_REACHED, order.get_id(), order.get_firm_id(), order.m_session_id,
                 order.get_side(), order.get_price(), order.get_initial_quantity());
             complete_trace(m_telemetry_policy, order.m_telemetry_idx);
             return;
@@ -533,11 +550,11 @@ private:
     AskBook m_ask_book;
     Clock m_matching_clock;
 
-    // Rejects an order whose quantity is outside (0, MAX_ORDER_QUANTITY],
-    // echoing the offending quantity. The caller completes the trace: no
-    // Order ever rested, so nothing later will.
-    void reject_invalid_quantity(OrderId orderId, FirmId firmId, SessionId sessionId, SIDE side, Price price,
-        Quantity quantity) {
+    // Rejects an order that never entered the book, echoing the offending
+    // quantity. The caller completes the trace: no Order ever rested, so
+    // nothing later will.
+    void reject_order(RejectReason reason, OrderId orderId, FirmId firmId, SessionId sessionId, SIDE side,
+        Price price, Quantity quantity) {
         m_telemetry_policy.on_order_event(OrderEvent{
             .type{OrderEventType::REJECTED},
             .timestamp{get_synced_time_ns()},
@@ -550,7 +567,7 @@ private:
             .quantity{quantity},
             .leaves_quantity{0},
             .match_id{0},
-            .reject_reason{RejectReason::INVALID_QUANTITY}
+            .reject_reason{reason}
             });
     }
 
@@ -621,7 +638,15 @@ private:
         // exceed the enter limit; the existing order is left untouched, same
         // as the price reject above.
         if (!is_valid_order_quantity(cmd.shares)) {
-            reject_invalid_quantity(cmd.orderId, existing->get_firm_id(), cmd.sessionId,
+            reject_order(RejectReason::INVALID_QUANTITY, cmd.orderId, existing->get_firm_id(), cmd.sessionId,
+                existing->get_side(), cmd.price, cmd.shares);
+            complete_trace(m_telemetry_policy, cmd.trace_id);
+            return;
+        }
+
+        // Checked before the cancel below, so a rejected replace leaves the original order resting.
+        if (cmd.replacementOrderId >= MAX_GLOBAL_ORDERS) {
+            reject_order(RejectReason::ORDER_LIMIT_REACHED, cmd.orderId, existing->get_firm_id(), cmd.sessionId,
                 existing->get_side(), cmd.price, cmd.shares);
             complete_trace(m_telemetry_policy, cmd.trace_id);
             return;
@@ -753,12 +778,12 @@ private:
     // so it doesn't also get a redundant ACCEPTED from insert_order.
     void limit(Order& order, OrderEventType eventType = OrderEventType::ACCEPTED) {
         if (order.get_side() == SIDE::BID && m_ask_book.get_best_price() == INVALID_PRICE) {
-            m_bid_book.insert_order(order, eventType);
+            rest_or_reject(order, eventType);
             return;
         }
 
         if (order.get_side() == SIDE::ASK && m_bid_book.get_best_price() == INVALID_PRICE) {
-            m_ask_book.insert_order(order, eventType);
+            rest_or_reject(order, eventType);
             return;
         }
 
@@ -773,13 +798,25 @@ private:
         }
 
         if (!order.is_filled()) {
-            if (order.get_side() == SIDE::BID) {
+            rest_or_reject(order, eventType);
+        }
+    }
+
+    // Rests what is left of an order, or rejects that remainder when its side of the book has no free pool
+    // slot. Fills already made stand. A replace never gets here with a full side: its own cancel freed a slot.
+    void rest_or_reject(Order& order, OrderEventType eventType) {
+        const bool bid = order.get_side() == SIDE::BID;
+        if (bid ? m_bid_book.has_free_slot() : m_ask_book.has_free_slot()) {
+            if (bid) {
                 m_bid_book.insert_order(order, eventType);
             }
             else {
                 m_ask_book.insert_order(order, eventType);
             }
+            return;
         }
+        reject_order(RejectReason::BOOK_FULL, order.get_id(), order.get_firm_id(), order.m_session_id,
+            order.get_side(), order.get_price(), order.get_remaining_quantity());
     }
         
     void cancel(OrderId orderId) {

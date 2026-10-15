@@ -26,6 +26,9 @@ constexpr bool is_valid_order_quantity(Quantity quantity) noexcept {
 
 using OrderId = std::uint64_t;
 constexpr OrderId INVALID_ORDER_ID = 0; // real ids are assigned starting at 1
+// Ids are minted in [1, ORDER_ID_LIMIT). The book's lookup table has one slot per id,
+// so an order with an id at or past this is rejected before it can reach the book.
+constexpr OrderId ORDER_ID_LIMIT = 10'000'000;
 using ExecutionId = std::uint64_t;
 using FirmId = std::uint32_t;
 using PoolIdx = std::uint32_t;

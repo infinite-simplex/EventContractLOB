@@ -73,7 +73,8 @@ namespace {
 //     that will never parse.
 //   - Well-formed frame, invalid content (unknown symbol, price outside
 //     [WORST_BID, WORST_ASK], shares outside (0, MAX_ORDER_QUANTITY] on an
-//     enter/replace): a real OuchOrderCommand can still be built.
+//     enter/replace, no order id left below ORDER_ID_LIMIT): a real
+//     OuchOrderCommand can still be built.
 //     Returns totalFrameLen with type = CommandType::INVALID and flows
 //     through the normal OrderBook reject pipeline — same as CANCEL_ORDER's
 //     unknown-token case below, which is accepted, not rejected, at this
@@ -151,6 +152,11 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
         // consume them yet — intentionally not read. reinterpret_cast means
         // there's no manual offset to "skip past" them either.
 
+        if (m_nextOrderId >= ORDER_ID_LIMIT) {
+            outCmd.type = CommandType::INVALID;
+            outCmd.invalidReason = RejectReason::ORDER_LIMIT_REACHED;
+            return totalFrameLen;
+        }
         outCmd.orderId = m_nextOrderId++;
         m_orderTokenRegistry.insert(outCmd.orderToken, outCmd.orderId);
 
@@ -222,6 +228,11 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
         // existing order wasn't found) — harmless either way, since an id
         // that was never actually inserted just safely no-ops on any later
         // lookup, same tolerant pattern OrderTokenRegistry already documents.
+        if (m_nextOrderId >= ORDER_ID_LIMIT) {
+            outCmd.type = CommandType::INVALID;
+            outCmd.invalidReason = RejectReason::ORDER_LIMIT_REACHED;
+            return totalFrameLen;
+        }
         outCmd.replacementOrderId = m_nextOrderId++;
         m_orderTokenRegistry.insert(outCmd.orderToken, outCmd.replacementOrderId);
 

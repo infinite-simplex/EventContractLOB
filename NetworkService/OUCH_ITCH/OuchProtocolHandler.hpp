@@ -16,11 +16,13 @@ public:
     // (NetworkGateway) is expected to close the connection, not retry.
     static constexpr size_t PARSE_FATAL_ERROR = static_cast<size_t>(-1);
 
-    OuchProtocolHandler(const SymbolRegistry& symbolRegistry, OrderTokenRegistry& orderTokenRegistry)
-        : m_symbolRegistry(symbolRegistry), m_orderTokenRegistry(orderTokenRegistry) {}
+    // firstOrderId is only ever not 1 in a test that needs to reach ORDER_ID_LIMIT.
+    OuchProtocolHandler(const SymbolRegistry& symbolRegistry, OrderTokenRegistry& orderTokenRegistry,
+        OrderId firstOrderId = 1)
+        : m_symbolRegistry(symbolRegistry), m_orderTokenRegistry(orderTokenRegistry), m_nextOrderId(firstOrderId) {}
     size_t validateAndParse(const char* buf, size_t availableLen, OuchOrderCommand& outCmd);
 private:
     const SymbolRegistry& m_symbolRegistry;
     OrderTokenRegistry& m_orderTokenRegistry; // single ingress thread only — see OrderTokenRegistry.hpp
-    OrderId m_nextOrderId{ 1 };               // incremented only for ENTER_ORDER frames
+    OrderId m_nextOrderId;                    // incremented only for ENTER_ORDER and REPLACE_ORDER frames
 };
