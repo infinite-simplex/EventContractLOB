@@ -22,6 +22,7 @@ enum class RejectReason : uint8_t {
     UNKNOWN_SYMBOL,       // ENTER_ORDER named a symbol SymbolRegistry never registered
     ORDER_LIMIT_REACHED,  // every order id below ORDER_ID_LIMIT has been used
     BOOK_FULL,            // that side of the book has no free slot for the part of the order that would rest
+    TOKEN_TABLE_FULL,     // the gateway's OrderTokenRegistry is at its limit and cannot register the new token
 };
 
 struct OrderEvent {

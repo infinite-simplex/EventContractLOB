@@ -6,6 +6,7 @@
 #include "MulticastIngressReceiver.hpp"
 #include "RetransmitServer.hpp"
 #include "OuchProtocolHandler.hpp"
+#include "OrderEventFrame.hpp"
 #include "OUCH.hpp"
 #include "SymbolRegistry.hpp"
 #include "OrderTokenRegistry.hpp"
@@ -13,6 +14,8 @@
 #include "NetworkConfig.hpp"
 #include "OuchOrderCommand.hpp"
 #include "IGoodTillDayScheduler.hpp"
+#include <array>
+#include <cstdio>
 #include <vector>
 #include <limits>
 #include <cstring>
@@ -2074,6 +2077,105 @@ TEST(NetworkIngressPipelineTest, HandlerRejectsInsteadOfMintingAnIdAtTheOrderIdL
     EXPECT_EQ(RejectReason::ORDER_LIMIT_REACHED, replace.invalidReason);
     EXPECT_EQ(INVALID_ORDER_ID, orderTokenRegistry.resolve(tokens[3])) << "a rejected replace registers no new token";
     EXPECT_EQ(ORDER_ID_LIMIT - 1, orderTokenRegistry.resolve(tokens[1])) << "and the old token still resolves";
+}
+
+// The table stops registering at 7/8 full, which keeps every probe short and ending at an empty slot.
+TEST(OrderTokenRegistryTest, RefusesNewTokensAtTheLoadLimitAndKeepsResolving) {
+    OrderTokenRegistry table(16);
+    EXPECT_EQ(14u, table.capacity());
+
+    const auto tokenFor = [](int n) {
+        std::array<char, 14> token{};
+        std::snprintf(token.data(), token.size(), "TOKEN%08d", n);
+        return token;
+    };
+    for (int n = 1; n <= 14; ++n) {
+        ASSERT_TRUE(table.insert(tokenFor(n).data(), static_cast<OrderId>(n))) << "token " << n;
+    }
+    EXPECT_EQ(14u, table.size());
+
+    EXPECT_FALSE(table.insert(tokenFor(15).data(), 15));
+    EXPECT_EQ(INVALID_ORDER_ID, table.resolve(tokenFor(15).data())) << "a refused token is not registered";
+    EXPECT_EQ(14u, table.size());
+
+    EXPECT_TRUE(table.insert(tokenFor(3).data(), 99)) << "a reused token re-points even at the limit";
+    EXPECT_EQ(99u, table.resolve(tokenFor(3).data()));
+    EXPECT_EQ(14u, table.size());
+
+    EXPECT_EQ(14u, table.resolve(tokenFor(14).data()));
+    EXPECT_EQ(INVALID_ORDER_ID, table.resolve(tokenFor(16).data())) << "a miss still ends at an empty slot";
+}
+
+// A full token table must reject an enter or a replace with TOKEN_TABLE_FULL, mint no id, and leave
+// cancels, the old token of a replace and reused tokens working.
+TEST(NetworkIngressPipelineTest, HandlerRejectsInsteadOfDroppingATokenWhenTheTokenTableIsFull) {
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+    OrderTokenRegistry orderTokenRegistry(16);
+    OuchProtocolHandler handler(registry, orderTokenRegistry);
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+
+    const auto parse = [&](const std::vector<char>& frame) {
+        OuchOrderCommand cmd{};
+        EXPECT_EQ(frame.size(), handler.validateAndParse(frame.data(), frame.size(), cmd));
+        return cmd;
+    };
+    const auto tokenFor = [](int n) {
+        std::array<char, 14> token{};
+        std::snprintf(token.data(), token.size(), "TABLEFULL%04d", n);
+        return token;
+    };
+
+    for (int n = 1; n <= 14; ++n) {
+        const auto entered = parse(BuildOuchEnterOrderFrame(tokenFor(n).data(), 'B', 10, symbol, 40));
+        ASSERT_EQ(CommandType::ENTER_ORDER, entered.type) << "order " << n;
+        ASSERT_EQ(static_cast<OrderId>(n), entered.orderId);
+    }
+
+    const auto refused = parse(BuildOuchEnterOrderFrame(tokenFor(15).data(), 'B', 10, symbol, 40));
+    EXPECT_EQ(CommandType::INVALID, refused.type);
+    EXPECT_EQ(RejectReason::TOKEN_TABLE_FULL, refused.invalidReason);
+    EXPECT_EQ(INVALID_ORDER_ID, orderTokenRegistry.resolve(tokenFor(15).data()));
+
+    const auto replace = parse(BuildOuchReplaceOrderFrame(tokenFor(2).data(), tokenFor(16).data(), 10, 45));
+    EXPECT_EQ(CommandType::INVALID, replace.type);
+    EXPECT_EQ(RejectReason::TOKEN_TABLE_FULL, replace.invalidReason);
+    EXPECT_EQ(INVALID_ORDER_ID, orderTokenRegistry.resolve(tokenFor(16).data()));
+    EXPECT_EQ(2u, orderTokenRegistry.resolve(tokenFor(2).data())) << "the order being replaced stays reachable";
+
+    const auto cancel = parse(BuildOuchCancelOrderFrame(tokenFor(3).data(), 0));
+    EXPECT_EQ(CommandType::CANCEL_ORDER, cancel.type);
+    EXPECT_EQ(3u, cancel.orderId);
+
+    const auto reused = parse(BuildOuchEnterOrderFrame(tokenFor(4).data(), 'S', 10, symbol, 60));
+    EXPECT_EQ(CommandType::ENTER_ORDER, reused.type);
+    EXPECT_EQ(15u, reused.orderId) << "the refused order and replace consumed no id";
+}
+
+// The egress frame is held inline, so encoding never allocates; this pins its byte layout.
+TEST(OrderEventFrameTest, EncodesTheDocumentedLayoutIntoAFixedBuffer) {
+    OrderEvent evt{};
+    evt.type = OrderEventType::EXECUTED;
+    evt.order_id = 0x0102030405060708ull;
+    evt.side = SIDE::ASK;
+    evt.price = 42;
+    evt.quantity = 0x0A0B0C0D;
+    evt.leaves_quantity = 0x11121314;
+    evt.match_id = 0x2122232425262728ull;
+    evt.reject_reason = RejectReason::BOOK_FULL;
+
+    const OrderEventFrame frame = OuchEventEncoder::encode(evt);
+    const unsigned char expected[] = {
+        0x00, 0x1C,                                      // payload length: type byte plus 27 body bytes
+        'E',
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,  // order id
+        'S', 42,                                         // side, price
+        0x0A, 0x0B, 0x0C, 0x0D,                          // quantity
+        0x11, 0x12, 0x13, 0x14,                          // leaves quantity
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,  // match id
+        static_cast<unsigned char>(RejectReason::BOOK_FULL) };
+    ASSERT_EQ(sizeof(expected), frame.size());
+    EXPECT_EQ(0, std::memcmp(expected, frame.data(), sizeof(expected)));
 }
 
 // Builds a real OUCHEnterOrder frame with the price field set to a raw

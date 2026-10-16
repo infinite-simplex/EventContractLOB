@@ -1,9 +1,9 @@
 #pragma once
 #include "OrderEvent.hpp"
 
+#include <array>
 #include <cstdint>
 #include <ostream>
-#include <vector>
 
 // Generic egress wire frame: one shared encoding for both the private OUCH
 // ack (unicast, over the originating client's TCP connection) and the public
@@ -29,38 +29,49 @@ inline char EncodeOrderEventTypeByte(OrderEventType type) {
     return '?';
 }
 
-inline std::vector<char> EncodeOrderEventFrame(const OrderEvent& evt) {
-    constexpr size_t bodyLen = 8 + 1 + 1 + 4 + 4 + 8 + 1;
-    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + bodyLen);
+// One encoded frame, held inline so encoding never allocates. EgressGateway
+// only needs data() and size().
+struct OrderEventFrame {
+    static constexpr size_t BODY_LEN = 8 + 1 + 1 + 4 + 4 + 8 + 1;
+    static constexpr size_t SIZE = 2 + 1 + BODY_LEN;
 
-    std::vector<char> frame(2 + payloadLen);
+    [[nodiscard]] const char* data() const noexcept { return bytes.data(); }
+    [[nodiscard]] static constexpr size_t size() noexcept { return SIZE; }
+
+    std::array<char, SIZE> bytes{};
+};
+
+inline OrderEventFrame EncodeOrderEventFrame(const OrderEvent& evt) {
+    constexpr uint16_t payloadLen = static_cast<uint16_t>(1 + OrderEventFrame::BODY_LEN);
+
+    OrderEventFrame frame;
     size_t off = 0;
 
     auto putBE16 = [&](uint16_t v) {
-        frame[off++] = static_cast<char>((v >> 8) & 0xFF);
-        frame[off++] = static_cast<char>(v & 0xFF);
+        frame.bytes[off++] = static_cast<char>((v >> 8) & 0xFF);
+        frame.bytes[off++] = static_cast<char>(v & 0xFF);
     };
     auto putBE32 = [&](uint32_t v) {
-        frame[off++] = static_cast<char>((v >> 24) & 0xFF);
-        frame[off++] = static_cast<char>((v >> 16) & 0xFF);
-        frame[off++] = static_cast<char>((v >> 8) & 0xFF);
-        frame[off++] = static_cast<char>(v & 0xFF);
+        frame.bytes[off++] = static_cast<char>((v >> 24) & 0xFF);
+        frame.bytes[off++] = static_cast<char>((v >> 16) & 0xFF);
+        frame.bytes[off++] = static_cast<char>((v >> 8) & 0xFF);
+        frame.bytes[off++] = static_cast<char>(v & 0xFF);
     };
     auto putBE64 = [&](uint64_t v) {
         for (int shift = 56; shift >= 0; shift -= 8) {
-            frame[off++] = static_cast<char>((v >> shift) & 0xFF);
+            frame.bytes[off++] = static_cast<char>((v >> shift) & 0xFF);
         }
     };
 
     putBE16(payloadLen);
-    frame[off++] = EncodeOrderEventTypeByte(evt.type);
+    frame.bytes[off++] = EncodeOrderEventTypeByte(evt.type);
     putBE64(static_cast<uint64_t>(evt.order_id));
-    frame[off++] = (evt.side == SIDE::BID) ? 'B' : (evt.side == SIDE::ASK) ? 'S' : ' ';
-    frame[off++] = static_cast<char>(evt.price);
+    frame.bytes[off++] = (evt.side == SIDE::BID) ? 'B' : (evt.side == SIDE::ASK) ? 'S' : ' ';
+    frame.bytes[off++] = static_cast<char>(evt.price);
     putBE32(static_cast<uint32_t>(evt.quantity));
     putBE32(static_cast<uint32_t>(evt.leaves_quantity));
     putBE64(static_cast<uint64_t>(evt.match_id));
-    frame[off++] = static_cast<char>(evt.reject_reason);
+    frame.bytes[off++] = static_cast<char>(evt.reject_reason);
 
     return frame;
 }
@@ -70,7 +81,7 @@ inline std::vector<char> EncodeOrderEventFrame(const OrderEvent& evt) {
 // wire bytes, static print() for the console debug line. Keeps every
 // OUCH-specific field name out of EgressGateway itself.
 struct OuchEventEncoder {
-    static std::vector<char> encode(const OrderEvent& evt) {
+    static OrderEventFrame encode(const OrderEvent& evt) {
         return EncodeOrderEventFrame(evt);
     }
 

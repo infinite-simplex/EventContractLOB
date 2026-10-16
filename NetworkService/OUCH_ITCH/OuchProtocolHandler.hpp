@@ -22,7 +22,14 @@ public:
         : m_symbolRegistry(symbolRegistry), m_orderTokenRegistry(orderTokenRegistry), m_nextOrderId(firstOrderId) {}
     size_t validateAndParse(const char* buf, size_t availableLen, OuchOrderCommand& outCmd);
 private:
+    // Registers the token. False, with nothing registered, when the token table is full.
+    bool registerToken(const char orderToken[14], OrderId id);
+
+    static constexpr uint8_t FILL_WARNING_PERCENT[2] = { 50, 80 };
+
     const SymbolRegistry& m_symbolRegistry;
     OrderTokenRegistry& m_orderTokenRegistry; // single ingress thread only — see OrderTokenRegistry.hpp
     OrderId m_nextOrderId;                    // incremented only for ENTER_ORDER and REPLACE_ORDER frames
+    size_t m_fillWarningsGiven{ 0 };
+    bool m_fullWarningGiven{ false };
 };

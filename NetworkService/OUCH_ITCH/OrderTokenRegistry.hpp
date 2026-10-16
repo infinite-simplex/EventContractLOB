@@ -20,42 +20,53 @@
 //
 // Append-only by design: nothing ever removes an entry. That avoids a second
 // writer thread ever touching this table (the matching thread never sees it),
-// at the cost of a bounded lifetime capacity — sized here for ~1M ENTER_ORDERs
-// (same daily-volume assumption as TELEMETRY_POOL_SIZE). A stale entry left
-// behind by an order that later filled or was canceled just resolves to an id
-// that safely no-ops downstream (OrderBook::cancel already tolerates unknown
-// ids), exactly like SymbolRegistry already tolerates unknown lookups.
+// at the cost of a bounded lifetime capacity. A stale entry left behind by an
+// order that later filled or was canceled just resolves to an id that safely
+// no-ops downstream (OrderBook::cancel already tolerates unknown ids), exactly
+// like SymbolRegistry already tolerates unknown lookups.
+//
+// Registrations stop at 7/8 of the table and insert() then returns false (the
+// handler rejects the order with TOKEN_TABLE_FULL). Past that load a linear
+// probe takes milliseconds, which stalls the whole gateway, and a table that is
+// never allowed to fill also guarantees every probe ends at an empty slot.
 class OrderTokenRegistry {
 public:
-    OrderTokenRegistry() : m_table(std::make_unique<Slot[]>(BUCKET_COUNT)) {}
+    // bucketCount must be a power of two of at least 8.
+    explicit OrderTokenRegistry(size_t bucketCount = DEFAULT_BUCKET_COUNT)
+        : m_mask(bucketCount - 1), m_maxEntries(bucketCount / 8 * 7),
+          m_table(std::make_unique<Slot[]>(bucketCount)) {}
 
-    // Registers (or, on a reused token, re-points) orderToken -> id.
-    // Called only for ENTER_ORDER frames.
-    void insert(const char orderToken[14], OrderId id) noexcept {
+    // Registers (or, on a reused token, re-points) orderToken -> id. Returns
+    // false, registering nothing, when the token is new and the table is at its
+    // limit. Called only for ENTER_ORDER and REPLACE_ORDER frames.
+    [[nodiscard]] bool insert(const char orderToken[14], OrderId id) noexcept {
         TokenKey key = make_key(orderToken);
-        size_t bucket = hash(key) & (BUCKET_COUNT - 1);
+        size_t bucket = hash(key) & m_mask;
 
-        for (size_t probes = 0; probes < BUCKET_COUNT; ++probes) {
+        while (true) {
             Slot& slot = m_table[bucket];
-            if (slot.id == INVALID_ORDER_ID || (slot.key.hi == key.hi && slot.key.lo == key.lo)) {
+            if (slot.id == INVALID_ORDER_ID) {
+                if (m_size >= m_maxEntries) return false;
                 slot.key = key;
                 slot.id = id;
-                return;
+                ++m_size;
+                return true;
             }
-            bucket = (bucket + 1) & (BUCKET_COUNT - 1);
+            if (slot.key.hi == key.hi && slot.key.lo == key.lo) {
+                slot.id = id;
+                return true;
+            }
+            bucket = (bucket + 1) & m_mask;
         }
-        // Table is completely full — drop the registration. Degraded (that
-        // order becomes uncancelable by token), not catastrophic, and keeps
-        // this a bounded, allocation-free, single-pass operation.
     }
 
     // CRITICAL HOT PATH METHOD: resolves orderToken -> OrderId, or
-    // INVALID_ORDER_ID if never registered (or the table is full).
+    // INVALID_ORDER_ID if never registered.
     [[nodiscard]] OrderId resolve(const char orderToken[14]) const noexcept {
         TokenKey key = make_key(orderToken);
-        size_t bucket = hash(key) & (BUCKET_COUNT - 1);
+        size_t bucket = hash(key) & m_mask;
 
-        for (size_t probes = 0; probes < BUCKET_COUNT; ++probes) {
+        while (true) {
             const Slot& slot = m_table[bucket];
             if (slot.id == INVALID_ORDER_ID) {
                 return INVALID_ORDER_ID; // empty slot — not registered
@@ -63,10 +74,12 @@ public:
             if (slot.key.hi == key.hi && slot.key.lo == key.lo) {
                 return slot.id;
             }
-            bucket = (bucket + 1) & (BUCKET_COUNT - 1);
+            bucket = (bucket + 1) & m_mask;
         }
-        return INVALID_ORDER_ID;
     }
+
+    [[nodiscard]] size_t size() const noexcept { return m_size; }
+    [[nodiscard]] size_t capacity() const noexcept { return m_maxEntries; }
 
 private:
     struct TokenKey {
@@ -100,10 +113,12 @@ private:
         return hash64(key.hi) ^ hash64(key.lo);
     }
 
-    // ~1M entries/day expected, 2x headroom for load factor (matches
-    // SymbolRegistry's MAX_SYMBOLS-to-BUCKET_COUNT ratio). Power of 2 for
-    // cheap bitwise masking instead of modulo.
-    static constexpr size_t BUCKET_COUNT = 2'097'152; // 2^21
+    // Power of 2 for cheap bitwise masking instead of modulo. Holds 1,835,008
+    // tokens, which is about 2.3 million orders when 80% of them mint a token.
+    static constexpr size_t DEFAULT_BUCKET_COUNT = 2'097'152; // 2^21
 
+    size_t m_mask;
+    size_t m_maxEntries;
+    size_t m_size{ 0 };
     std::unique_ptr<Slot[]> m_table;
 };

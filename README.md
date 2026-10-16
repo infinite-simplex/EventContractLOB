@@ -39,9 +39,13 @@ Design rationale and tradeoffs are written up in the
   that would rest is rejected with `BOOK_FULL`; fills it already made stand.
 - **Order ids:** 10,000,000 per run (one counter, never reset). After that every
   enter and replace is rejected with `ORDER_LIMIT_REACHED`.
+- **Order tokens:** the gateway remembers 1,835,008 distinct client order tokens per run,
+  one per enter and one per replace. Past that every new enter and replace is rejected with
+  `TOKEN_TABLE_FULL`; orders already registered can still be canceled or replaced. It logs a
+  warning at 50% and 80% full.
 
-Every check above runs in the OUCH handler (a bad frame becomes a rejected command
-without dropping the connection) and again in the book, so nothing that
+The price, quantity and order-id checks run in the OUCH handler (a bad frame becomes a rejected
+command without dropping the connection) and again in the book, so nothing that
 bypasses the handler can rest an out-of-range order.
 
 ## Building and running

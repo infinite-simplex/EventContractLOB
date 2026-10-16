@@ -1,6 +1,10 @@
 #include "OuchProtocolHandler.hpp"
 #include "OUCH.hpp"
 
+#include <iostream>
+#include <iterator>
+#include <string>
+
 
 // ---- Wire-format helpers -------------------------------------------------
 // ASSUMPTION: all multi-byte integers on the wire are big-endian.
@@ -54,6 +58,29 @@ namespace {
 
 } // namespace
 
+bool OuchProtocolHandler::registerToken(const char orderToken[14], OrderId id) {
+    if (!m_orderTokenRegistry.insert(orderToken, id)) {
+        if (!m_fullWarningGiven) {
+            m_fullWarningGiven = true;
+            // One string per write: the egress thread prints to the same console.
+            std::cerr << ("[WARNING] Order token table is full (" + std::to_string(m_orderTokenRegistry.capacity())
+                + " tokens): new orders and replaces are rejected with TOKEN_TABLE_FULL.\n");
+        }
+        return false;
+    }
+
+    if (m_fillWarningsGiven < std::size(FILL_WARNING_PERCENT)) {
+        const size_t percent = FILL_WARNING_PERCENT[m_fillWarningsGiven];
+        if (m_orderTokenRegistry.size() * 100 >= m_orderTokenRegistry.capacity() * percent) {
+            ++m_fillWarningsGiven;
+            std::cerr << ("[WARNING] Order token table is " + std::to_string(percent) + "% full ("
+                + std::to_string(m_orderTokenRegistry.size()) + " of " + std::to_string(m_orderTokenRegistry.capacity())
+                + " tokens).\n");
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Real NASDAQ OUCH 4.2 wire structs, from OUCH.hpp. Frame on the wire:
 //   [2B BE payloadLen][1B msgType]<rest of that OUCH.hpp struct>
@@ -73,7 +100,7 @@ namespace {
 //     that will never parse.
 //   - Well-formed frame, invalid content (unknown symbol, price outside
 //     [WORST_BID, WORST_ASK], shares outside (0, MAX_ORDER_QUANTITY] on an
-//     enter/replace, no order id left below ORDER_ID_LIMIT): a real
+//     enter/replace, no order id left below ORDER_ID_LIMIT, no room in the token table): a real
 //     OuchOrderCommand can still be built.
 //     Returns totalFrameLen with type = CommandType::INVALID and flows
 //     through the normal OrderBook reject pipeline — same as CANCEL_ORDER's
@@ -157,8 +184,12 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
             outCmd.invalidReason = RejectReason::ORDER_LIMIT_REACHED;
             return totalFrameLen;
         }
+        if (!registerToken(outCmd.orderToken, m_nextOrderId)) {
+            outCmd.type = CommandType::INVALID;
+            outCmd.invalidReason = RejectReason::TOKEN_TABLE_FULL;
+            return totalFrameLen;
+        }
         outCmd.orderId = m_nextOrderId++;
-        m_orderTokenRegistry.insert(outCmd.orderToken, outCmd.orderId);
 
         outCmd.type = CommandType::ENTER_ORDER;
         return totalFrameLen;
@@ -233,8 +264,12 @@ size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLe
             outCmd.invalidReason = RejectReason::ORDER_LIMIT_REACHED;
             return totalFrameLen;
         }
+        if (!registerToken(outCmd.orderToken, m_nextOrderId)) {
+            outCmd.type = CommandType::INVALID;
+            outCmd.invalidReason = RejectReason::TOKEN_TABLE_FULL;
+            return totalFrameLen;
+        }
         outCmd.replacementOrderId = m_nextOrderId++;
-        m_orderTokenRegistry.insert(outCmd.orderToken, outCmd.replacementOrderId);
 
         outCmd.stockLocate = 0;
         outCmd.buySellIndicator = '\0';
