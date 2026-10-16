@@ -3,7 +3,10 @@
 # driven by OuchLoadGenerator, then a summary of the one-second windows the performance service printed.
 # Needs a build configured with -DBUILD_PERFORMANCE_SERVICE=ON. Run it under WSL/Linux.
 #
-#   Tools/load_test.sh [orders-per-second] [seconds] [build-dir]
+#   Tools/load_test.sh [orders-per-second] [seconds] [build-dir] [tuned]
+#
+# "tuned" is Core's advice for load: the replicas spin 100 us after each datagram, and the gateway does not
+# print an "[egress]" line per event. Without it Core's defaults run.
 #
 # Each window holds the commands whose traces completed in that second. The first three windows (the
 # book is still empty) and the last (partial) are left out. For every metric the summary gives, over
@@ -14,6 +17,12 @@ set -uo pipefail
 RATE="${1:-10000}"
 SECONDS_RUN="${2:-30}"
 BUILD_DIR="${3:-build}"
+GATEWAY_FLAGS=()
+REPLICA_FLAGS=()
+if [ "${4:-}" = "tuned" ]; then
+    GATEWAY_FLAGS=(--no-egress-echo)
+    REPLICA_FLAGS=(--ingress-spin-us 100)
+fi
 
 NET_BIN="$BUILD_DIR/NetworkService/NetworkServiceApp"
 MATCH_BIN="$BUILD_DIR/MatchingService/MatchingServiceApp"
@@ -39,12 +48,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$NET_BIN" --sequence-store "$WORKDIR/sequence_store.dat" --symbol TEST > "$WORKDIR/network.log" 2>&1 &
+"$NET_BIN" --sequence-store "$WORKDIR/sequence_store.dat" --symbol TEST "${GATEWAY_FLAGS[@]}" > "$WORKDIR/network.log" 2>&1 &
 PIDS+=("$!")
+GATEWAY_PID="$!"
 sleep 0.3
 REPLICA_PIDS=()
 for i in 1 2; do
-    "$MATCH_BIN" --id "replica-$i" --replica-id "$i" --stats-interval-ms 500 > "$WORKDIR/replica-$i.log" 2>&1 &
+    "$MATCH_BIN" --id "replica-$i" --replica-id "$i" --stats-interval-ms 500 "${REPLICA_FLAGS[@]}" > "$WORKDIR/replica-$i.log" 2>&1 &
     PIDS+=("$!")
     REPLICA_PIDS+=("$!")
 done
@@ -77,6 +87,9 @@ done
 # A graceful stop makes each replica print its final sequence number and a digest of its whole book.
 kill -TERM "${REPLICA_PIDS[@]}" 2>/dev/null
 wait "${REPLICA_PIDS[@]}" 2>/dev/null
+# Stopping the gateway makes it print what its egress side received.
+kill -TERM "$GATEWAY_PID" 2>/dev/null
+wait "$GATEWAY_PID" 2>/dev/null
 echo
 for i in 1 2; do
     echo "replica-$i $(grep -o 'final applied=.*' "$WORKDIR/replica-$i.log" | tail -1)   (sequence gaps recovered: $(grep -c 'Sequence gap' "$WORKDIR/replica-$i.log"), leader changes: $(( $(grep -o 'epoch=[0-9]*' "$WORKDIR/replica-$i.log" | cut -d= -f2 | sort -n | tail -1) - 1 )))"
@@ -87,6 +100,7 @@ if [ "$(grep -o 'final applied=.*' "$WORKDIR/replica-1.log" | tail -1)" = "$(gre
 else
     echo "replicas: DIFFERENT books (or a replica did not stop cleanly)"
 fi
+echo "gateway $(grep -a 'egress stats:' "$WORKDIR/network.log" | tail -1)   (egress loss warnings: $(grep -a -c 'did not receive' "$WORKDIR/network.log"))"
 echo
 
 python3 - "$WORKDIR/performance.log" "$WORKDIR/generator.txt" <<'PYEOF'

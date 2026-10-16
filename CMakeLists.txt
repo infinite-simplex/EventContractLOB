@@ -17,7 +17,7 @@ include(FetchContent)
 FetchContent_Declare(
   Core
   GIT_REPOSITORY https://github.com/infinite-simplex/ToyExchange.git
-  GIT_TAG v0.2.1
+  GIT_TAG v0.3.0
   SOURCE_SUBDIR Core
 )
 FetchContent_MakeAvailable(Core)

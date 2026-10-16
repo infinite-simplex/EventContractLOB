@@ -59,9 +59,17 @@ cmake --build build -j"$(nproc)"
 ./run_exchange.sh 2 build
 ```
 
-Core asks for 4 MB UDP receive buffers. If `net.core.rmem_max` is lower, the receivers print a
-warning at start-up and a burst can drop datagrams (retransmit recovers them, at a cost);
+Core asks for 4 MB UDP receive buffers. If `net.core.rmem_max` is lower, the receivers and the
+gateway print a warning at start-up and a burst can drop datagrams (retransmit recovers the
+replicas' ingress ones, at a cost; a lost egress datagram is not recovered, and the gateway
+counts and warns about the events that never arrived);
 `sudo sysctl -w net.core.rmem_max=4194304` removes it.
+
+For load, Core advises two settings: `--ingress-spin-us 100` on each `MatchingServiceApp`
+(the receiver polls for 100 µs after a datagram before it sleeps) and `--no-egress-echo` on
+`NetworkServiceApp` (no `[egress]` console line per event). `--egress-spin-us` is the
+gateway's equivalent of the first. The replicas and the gateway must run the same Core version,
+because the egress wire format changed in v0.3.0.
 
 Then, from another shell:
 
@@ -80,6 +88,7 @@ Configure with `-DBUILD_PERFORMANCE_SERVICE=ON`, then:
 
 ```bash
 Tools/load_test.sh 10000 30 build   # whole stack under OuchLoadGenerator: orders/s, seconds
+Tools/load_test.sh 200000 10 build tuned   # the same with the two load settings above
 build/Tools/OrderBookBench/OrderBookBench   # the book alone: cost per trade against level depth
 Tools/bench_counters.sh 12 build    # what the two telemetry counters cost
 Tools/engine_throughput.sh 30 build # the engine alone: sustained orders/s, no gateway or sockets

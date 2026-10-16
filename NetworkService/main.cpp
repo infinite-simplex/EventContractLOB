@@ -47,6 +47,8 @@ int main(int argc, char** argv) {
         else if (arg == "--itch-ip") config.publicBroadcastIp = next();
         else if (arg == "--itch-port") config.publicBroadcastPort = static_cast<uint16_t>(std::stoi(next()));
         else if (arg == "--arbitration-port") config.arbitrationPort = static_cast<uint16_t>(std::stoi(next()));
+        else if (arg == "--egress-spin-us") config.egressSpinMicros = static_cast<uint32_t>(std::stoul(next()));
+        else if (arg == "--no-egress-echo") config.egressConsoleEcho = false;
         else {
             std::cerr << "Unknown argument: " << arg << "\n";
             return 1;
@@ -109,6 +111,11 @@ int main(int argc, char** argv) {
 
     std::cout << "NetworkService shutting down...\n";
     egressGateway.stop();
+    const EgressStats egress = egressGateway.stats();
+    std::cout << "egress stats: batches=" << egress.batches << " events=" << egress.events
+              << " missing=" << egress.missingEvents << " repeated=" << egress.repeatedEvents
+              << " stale=" << egress.staleEvents << " malformed=" << egress.malformedDatagrams
+              << " dropped_client_bytes=" << gateway.droppedOutputBytes() << "\n";
     arbiter.stop();
     retransmitServer.stop();
     gateway.stop();
