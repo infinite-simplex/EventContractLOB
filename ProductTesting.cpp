@@ -14,8 +14,10 @@
 #include "NetworkConfig.hpp"
 #include "OuchOrderCommand.hpp"
 #include "IGoodTillDayScheduler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
+#include <random>
 #include <vector>
 #include <limits>
 #include <cstring>
@@ -2104,6 +2106,184 @@ TEST(OrderTokenRegistryTest, RefusesNewTokensAtTheLoadLimitAndKeepsResolving) {
 
     EXPECT_EQ(14u, table.resolve(tokenFor(14).data()));
     EXPECT_EQ(INVALID_ORDER_ID, table.resolve(tokenFor(16).data())) << "a miss still ends at an empty slot";
+}
+
+// A 14-byte order token: `prefix`, then n in decimal zero-padded to 13 characters, then a terminator.
+std::array<char, 14> NumberedToken(const char* prefix, size_t n) {
+    std::array<char, 14> token{};
+    std::memcpy(token.data(), prefix, std::strlen(prefix));
+    for (size_t i = 13; i-- > std::strlen(prefix); n /= 10) token[i] = static_cast<char>('0' + n % 10);
+    return token;
+}
+
+// A table of 2 MiB or more takes the huge-page allocation path (2 MiB-aligned, madvised, zeroed by hand);
+// a smaller one takes the ordinary path. Both must hold exactly what was put in and nothing else.
+TEST(OrderTokenRegistryTest, BehavesTheSameOnTheOrdinaryAndHugePageAllocationPaths) {
+    const auto tokenFor = [](size_t n) { return NumberedToken("TOKEN", n); };
+    for (const size_t buckets : { size_t{ 16 }, size_t{ 1 } << 12, size_t{ 1 } << 17 }) { // 384 B, 96 KiB, 3 MiB
+        SCOPED_TRACE(buckets);
+        OrderTokenRegistry table(buckets);
+        const size_t tokens = table.capacity();
+        for (size_t n = 1; n <= tokens; ++n) {
+            ASSERT_TRUE(table.insert(tokenFor(n).data(), static_cast<OrderId>(n))) << "token " << n;
+        }
+        EXPECT_EQ(tokens, table.size());
+        EXPECT_FALSE(table.insert(tokenFor(tokens + 1).data(), 1)) << "full at 7/8";
+        for (size_t n = 1; n <= tokens; ++n) {
+            ASSERT_EQ(static_cast<OrderId>(n), table.resolve(tokenFor(n).data())) << "token " << n;
+        }
+        for (size_t n = tokens + 1; n <= tokens + 1000; ++n) {
+            ASSERT_EQ(INVALID_ORDER_ID, table.resolve(tokenFor(n).data())) << "a token never inserted must not resolve";
+        }
+    }
+}
+
+// prefetch() is a hint: whatever it is asked about, registered or not, the table afterwards is the table before.
+TEST(OrderTokenRegistryTest, PrefetchChangesNothing) {
+    OrderTokenRegistry table(1 << 12);
+    const auto tokenFor = [](int n) {
+        std::array<char, 14> token{};
+        std::snprintf(token.data(), token.size(), "PREFETCH%05d", n);
+        return token;
+    };
+    for (int n = 1; n <= 1000; ++n) ASSERT_TRUE(table.insert(tokenFor(n).data(), static_cast<OrderId>(n)));
+    for (int n = 1; n <= 2000; ++n) table.prefetch(tokenFor(n).data());
+    EXPECT_EQ(1000u, table.size());
+    for (int n = 1; n <= 1000; ++n) ASSERT_EQ(static_cast<OrderId>(n), table.resolve(tokenFor(n).data()));
+    for (int n = 1001; n <= 2000; ++n) ASSERT_EQ(INVALID_ORDER_ID, table.resolve(tokenFor(n).data()));
+}
+
+// OuchProtocolHandler prefetches the token buckets of the frames queued behind the one it parses. That must
+// change no result. One fixed, randomly chunked byte stream over several connections (the handler is shared by
+// all of them, as in NetworkGateway, and some replays stop early so a look-ahead is left half-used when another
+// connection takes over) is replayed with the look-ahead off, at the default distance and at the maximum. Every
+// parse result, and the token table at the end, must be identical. The stream reuses and mixes up tokens, names
+// an unknown symbol, and is long enough for the small token table to fill, so every path is covered.
+TEST(OuchProtocolHandlerTest, TokenLookAheadChangesNoParseResultAndNoTableContents) {
+    constexpr int CONNECTIONS = 3;
+    constexpr int FRAMES_PER_CONNECTION = 1500;
+    constexpr size_t TOKEN_TABLE_BUCKETS = 1024; // 896 tokens: fills part-way through the stream
+    const char symbol[8] = { 'T', 'E', 'S', 'T', ' ', ' ', ' ', ' ' };
+    const char unknownSymbol[8] = { 'N', 'O', 'P', 'E', ' ', ' ', ' ', ' ' };
+
+    std::mt19937_64 rng(20261101);
+    const auto below = [&](uint64_t n) { return static_cast<size_t>(rng() % n); };
+    const auto tokenFor = [](size_t n) { return NumberedToken("LOOKAHD", n); };
+
+    // One byte stream per connection.
+    size_t minted = 0;
+    const auto anyToken = [&]() { return tokenFor(1 + below(minted + 20)); }; // sometimes one never entered
+    std::vector<std::vector<char>> streams(CONNECTIONS);
+    for (auto& stream : streams) {
+        for (int i = 0; i < FRAMES_PER_CONNECTION; ++i) {
+            std::vector<char> frame;
+            const size_t draw = below(100);
+            const char side = below(2) ? 'B' : 'S';
+            if (draw < 40) {
+                frame = BuildOuchEnterOrderFrame(tokenFor(++minted).data(), side, 10, symbol, 40 + static_cast<uint32_t>(below(20)));
+            } else if (draw < 45) {
+                frame = BuildOuchEnterOrderFrame(anyToken().data(), side, 10, symbol, 45); // a reused (or fresh) token
+            } else if (draw < 48) {
+                frame = BuildOuchEnterOrderFrame(tokenFor(++minted).data(), side, 10, unknownSymbol, 45);
+            } else if (draw < 70) {
+                frame = BuildOuchCancelOrderFrame(anyToken().data(), 0);
+            } else if (draw < 90) {
+                frame = BuildOuchReplaceOrderFrame(anyToken().data(), tokenFor(++minted).data(), 10, 50);
+            } else {
+                frame = BuildOuchReplaceOrderFrame(anyToken().data(), anyToken().data(), 10, 50); // replacement token reused
+            }
+            stream.insert(stream.end(), frame.begin(), frame.end());
+        }
+    }
+    // A complete frame of an unknown message type ends a connection: validateAndParse reports a fatal error.
+    const std::vector<char> unknownType = { 0, 3, 'Z', 0, 0 };
+    streams.back().insert(streams.back().end(), unknownType.begin(), unknownType.end());
+
+    // The schedule: which connection's next bytes arrive, how many, and how many frames get parsed before
+    // control moves on (0 = until the buffer holds no complete frame, as NetworkGateway does).
+    struct Step { int connection; size_t offset; size_t length; unsigned parseLimit; };
+    std::vector<Step> schedule;
+    std::vector<size_t> sent(CONNECTIONS, 0);
+    for (;;) {
+        std::vector<int> open;
+        for (int c = 0; c < CONNECTIONS; ++c) if (sent[c] < streams[c].size()) open.push_back(c);
+        if (open.empty()) break;
+        const int c = open[below(open.size())];
+        const size_t length = std::min(1 + below(300), streams[c].size() - sent[c]);
+        schedule.push_back({ c, sent[c], length, below(2) ? 0u : static_cast<unsigned>(1 + below(4)) });
+        sent[c] += length;
+    }
+
+    struct Result {
+        size_t consumed;
+        CommandType type; RejectReason reason; OrderId orderId, replacementOrderId;
+        std::array<char, 14> token; Price price; Quantity shares; uint32_t stockLocate; char side;
+        bool operator==(const Result&) const = default;
+    };
+    struct Replay { std::vector<Result> results; std::vector<OrderId> table; size_t tableSize; };
+
+    SymbolRegistry registry;
+    registry.registerSymbol("TEST");
+
+    const auto replay = [&](unsigned distance) {
+        OrderTokenRegistry tokens(TOKEN_TABLE_BUCKETS);
+        OuchProtocolHandler handler(registry, tokens, 1, distance);
+        std::vector<std::vector<char>> buffers(CONNECTIONS);
+        std::vector<bool> closed(CONNECTIONS, false);
+        Replay out;
+        const auto drain = [&](int c, unsigned limit) {
+            auto& buf = buffers[c];
+            for (unsigned parsed = 0; !closed[c] && (limit == 0 || parsed < limit); ++parsed) {
+                OuchOrderCommand cmd{};
+                const size_t consumed = handler.validateAndParse(buf.data(), buf.size(), cmd);
+                Result r{};
+                r.consumed = consumed;
+                if (consumed == OuchProtocolHandler::PARSE_FATAL_ERROR) {
+                    out.results.push_back(r);
+                    closed[c] = true; // the gateway closes the connection
+                    return;
+                }
+                if (consumed != 0) {
+                    r.type = cmd.type; r.reason = cmd.invalidReason; r.orderId = cmd.orderId;
+                    r.replacementOrderId = cmd.replacementOrderId; std::memcpy(r.token.data(), cmd.orderToken, 14);
+                    r.price = cmd.price; r.shares = cmd.shares; r.stockLocate = cmd.stockLocate; r.side = cmd.buySellIndicator;
+                }
+                out.results.push_back(r);
+                if (consumed == 0) return;
+                buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(consumed));
+            }
+        };
+        for (const Step& step : schedule) {
+            if (closed[step.connection]) continue;
+            const auto first = streams[step.connection].begin() + static_cast<std::ptrdiff_t>(step.offset);
+            buffers[step.connection].insert(buffers[step.connection].end(), first, first + static_cast<std::ptrdiff_t>(step.length));
+            drain(step.connection, step.parseLimit);
+        }
+        for (int c = 0; c < CONNECTIONS; ++c) drain(c, 0);
+        out.tableSize = tokens.size();
+        for (size_t n = 1; n <= minted + 20; ++n) out.table.push_back(tokens.resolve(tokenFor(n).data()));
+        return out;
+    };
+
+    const Replay off = replay(0);
+    for (const unsigned distance : { OuchProtocolHandler::DEFAULT_PREFETCH_DISTANCE, OuchProtocolHandler::MAX_PREFETCH_DISTANCE }) {
+        SCOPED_TRACE(distance);
+        const Replay on = replay(distance);
+        ASSERT_EQ(off.results.size(), on.results.size());
+        for (size_t i = 0; i < off.results.size(); ++i) {
+            ASSERT_TRUE(off.results[i] == on.results[i]) << "parse result " << i << " differs";
+        }
+        EXPECT_EQ(off.tableSize, on.tableSize);
+        EXPECT_TRUE(off.table == on.table) << "token table contents differ";
+    }
+
+    // The comparison above would pass trivially if the stream never reached the interesting cases.
+    const auto count = [&](const auto& pred) { return std::count_if(off.results.begin(), off.results.end(), pred); };
+    EXPECT_GT(count([](const Result& r) { return r.consumed != 0 && r.consumed != OuchProtocolHandler::PARSE_FATAL_ERROR && r.type == CommandType::ENTER_ORDER; }), 500);
+    EXPECT_GT(count([](const Result& r) { return r.consumed != 0 && r.consumed != OuchProtocolHandler::PARSE_FATAL_ERROR && r.type == CommandType::CANCEL_ORDER; }), 500);
+    EXPECT_GT(count([](const Result& r) { return r.consumed != 0 && r.consumed != OuchProtocolHandler::PARSE_FATAL_ERROR && r.type == CommandType::REPLACE_ORDER; }), 500);
+    EXPECT_GT(count([](const Result& r) { return r.reason == RejectReason::TOKEN_TABLE_FULL; }), 0) << "the stream must fill the token table";
+    EXPECT_EQ(1, count([](const Result& r) { return r.consumed == OuchProtocolHandler::PARSE_FATAL_ERROR; }));
 }
 
 // A full token table must reject an enter or a replace with TOKEN_TABLE_FULL, mint no id, and leave

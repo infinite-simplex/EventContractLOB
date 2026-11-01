@@ -108,7 +108,70 @@ bool OuchProtocolHandler::registerToken(const char orderToken[14], OrderId id) {
 //     layer.
 // ---------------------------------------------------------------------------
 
+// Token look-ahead. Every token hashes to a random bucket of a table far larger than the CPU
+// caches, so the lookup a frame needs is normally a trip to main memory. The gateway usually
+// holds many complete frames in one read buffer, so while this one is parsed the buckets the
+// next few will touch are already known: an enter inserts its token, a cancel resolves its
+// token, a replace resolves the existing token and inserts the replacement. Hinting them now
+// overlaps those memory trips with the parsing in between.
+//
+// Hints only. This reads bytes inside [0, availableLen) and changes no result, so it needs
+// no validation of its own: a frame it cannot make sense of simply ends the look-ahead, and
+// parseFrame() reports it when its turn comes.
+void OuchProtocolHandler::prefetchAhead(const char* buf, size_t availableLen, size_t currentLen) {
+    if (m_ahead == 0 || m_frontier < currentLen || m_frontier > availableLen) {
+        m_ahead = 0;
+        m_frontier = currentLen; // nothing prefetched yet: start right after the current frame
+    }
+    while (m_ahead < m_prefetchDistance) {
+        if (m_frontier + 3 > availableLen) break; // need the length and the type byte
+        const size_t payloadLen = readBE16(buf + m_frontier);
+        const size_t total = 2 + payloadLen;
+        if (m_frontier + total > availableLen) break; // that frame has not fully arrived yet
+        const char* body = buf + m_frontier + 2;      // the message type byte
+        switch (body[0]) {
+        case 'O':
+            if (payloadLen != sizeof(OUCHEnterOrder)) return;
+            m_orderTokenRegistry.prefetch(reinterpret_cast<const OUCHEnterOrder*>(body)->orderToken);
+            break;
+        case 'X':
+            if (payloadLen != sizeof(OUCHCancelOrder)) return;
+            m_orderTokenRegistry.prefetch(reinterpret_cast<const OUCHCancelOrder*>(body)->orderToken);            break;
+        case 'U': {
+            if (payloadLen != sizeof(OUCHReplaceOrder)) return;
+            const auto* wire = reinterpret_cast<const OUCHReplaceOrder*>(body);
+            m_orderTokenRegistry.prefetch(wire->existingOrderToken);
+            m_orderTokenRegistry.prefetch(wire->replacementOrderToken);
+            break;
+        }
+        default:
+            return; // not a frame this look-ahead understands: do not look past it
+        }
+        m_frontier += total;
+        ++m_ahead;
+    }
+}
+
 size_t OuchProtocolHandler::validateAndParse(const char* buf, size_t availableLen, OuchOrderCommand& outCmd) {
+    if (m_prefetchDistance != 0 && availableLen >= 2) {
+        const size_t currentLen = 2 + readBE16(buf);
+        if (currentLen <= availableLen) prefetchAhead(buf, availableLen, currentLen);
+    }
+    const size_t consumed = parseFrame(buf, availableLen, outCmd);
+    if (consumed == 0 || consumed == PARSE_FATAL_ERROR) {
+        m_ahead = 0; // no complete frame left in this buffer
+    } else if (m_ahead > 0) {
+        if (m_frontier >= consumed) {
+            m_frontier -= consumed; // the next frame is now the current one
+            --m_ahead;
+        } else {
+            m_ahead = 0;
+        }
+    }
+    return consumed;
+}
+
+size_t OuchProtocolHandler::parseFrame(const char* buf, size_t availableLen, OuchOrderCommand& outCmd) {
     constexpr size_t LENGTH_FIELD_SIZE = 2;
 
     if (availableLen < LENGTH_FIELD_SIZE) {
