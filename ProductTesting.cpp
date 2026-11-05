@@ -1151,8 +1151,8 @@ TEST_F(MatchingEngineTest, StateDigestMatchesForTheSameOrdersAndMovesForAnyDiffe
     EXPECT_NE(first.state_digest(), second.state_digest()) << "the same two orders in the other arrival order";
 }
 
-// A side holds BOOK_POOL_SIZE resting orders. The order after that used to throw out of the matching
-// thread; it is now rejected, and only the part that would have rested.
+// A side holds BOOK_POOL_SIZE resting orders. The order after that must not throw out of the matching
+// thread: it is rejected, and only the part that would have rested.
 TEST_F(MatchingEngineTest, FullBookSideRejectsWhatCannotRestInsteadOfThrowing) {
     for (OrderId id = 1; id <= BOOK_POOL_SIZE; ++id) {
         Order bid(id, FIRM_A, SIDE::BID, ORDER_TYPE::LIMIT, 50, 1);
@@ -1416,9 +1416,9 @@ TEST_F(MatchingEngineTest, TakerFullFillCompletesItsOwnTraceNotJustTheMakers) {
     Order takerBid(2, FIRM_B, SIDE::BID, ORDER_TYPE::LIMIT, 50, 100);
     LOB.submit_order(takerBid);
 
-    // Before the fix this was 1 (only the maker's eviction completed a
-    // trace) — the taker crossed and fully filled without ever resting, so
-    // nothing else would ever have completed its own trace.
+    // The maker's eviction completes one trace; the taker crossed and fully
+    // filled without ever resting, so nothing else would ever complete its
+    // own trace and the book must complete it directly.
     EXPECT_EQ(size_t(2), traces.size())
         << "both the fully-filled maker (evicted) and the fully-filled taker (never rested) should complete a trace";
 }
@@ -1443,8 +1443,8 @@ TEST_F(MatchingEngineTest, SelfTradePreventionRejectCompletesItsOwnTrace) {
 
 TEST_F(MatchingEngineTest, ImmediateOrCancelWithNoLiquidityCompletesItsOwnTrace) {
     // No resting liquidity at all — the IOC matches nothing and its entire
-    // quantity is canceled. IOC never rests by design, so before the fix
-    // nothing would ever have completed its trace.
+    // quantity is canceled. IOC never rests by design, so nothing else would
+    // ever complete its trace and the book must complete it directly.
     Order iocBid(1, FIRM_A, SIDE::BID, ORDER_TYPE::IMMEDIATE_OR_CANCEL, 50, 100);
     LOB.submit_order(iocBid);
 
@@ -1894,12 +1894,10 @@ TEST(NetworkIngressPipelineTest, UnknownSymbolIsRejectedNotDisconnected) {
     gateway.stop();
 }
 
-// Regression test for a real narrowing bug: outCmd.price = readBE32(...)
-// used to assign a decoded uint32_t straight into Price (uint8_t) with no
-// bounds check, so an out-of-range wire price would silently wrap instead
-// of being rejected (e.g. 300 -> 44, which then passed OrderBook's own
-// downstream `cmd.price > WORST_ASK` check). decodePrice() in
-// OuchProtocolHandler.cpp now bounds-checks before narrowing.
+// A wire price is a uint32_t and Price is a uint8_t, so decodePrice() in
+// OuchProtocolHandler.cpp must bounds-check before narrowing. An out-of-range
+// price must be rejected, not wrap (e.g. 300 -> 44, which would then pass
+// OrderBook's own downstream `cmd.price > WORST_ASK` check).
 TEST(NetworkIngressPipelineTest, OutOfRangePriceIsRejectedNotDisconnected) {
     SymbolRegistry registry;
     registry.registerSymbol("TEST");

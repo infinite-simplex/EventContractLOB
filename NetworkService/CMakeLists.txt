@@ -9,10 +9,9 @@ list(REMOVE_ITEM NETWORK_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp")
 # Define the static binary target
 add_library(NetworkService STATIC ${NETWORK_SOURCES})
 
-# Every header still uses a flat #include "X.hpp" regardless of which
-# subfolder it now lives in, so each subfolder needs to be on the include
-# path too — this keeps the folder split purely organizational, with no
-# include-statement churn anywhere else in the codebase.
+# Every header uses a flat #include "X.hpp" regardless of which subfolder
+# it lives in, so each subfolder needs to be on the include path too —
+# this keeps the folder split purely organizational.
 target_include_directories(NetworkService PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/OUCH_ITCH

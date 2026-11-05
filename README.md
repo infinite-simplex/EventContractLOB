@@ -69,7 +69,7 @@ For load, Core advises two settings: `--ingress-spin-us 100` on each `MatchingSe
 (the receiver polls for 100 µs after a datagram before it sleeps) and `--no-egress-echo` on
 `NetworkServiceApp` (no `[egress]` console line per event). `--egress-spin-us` is the
 gateway's equivalent of the first. The replicas and the gateway must run the same Core version,
-because the egress wire format changed in v0.3.0.
+because the egress wire format can change between Core versions.
 
 Then, from another shell:
 

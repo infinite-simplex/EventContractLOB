@@ -2,8 +2,8 @@
 #include <chrono>
 #include <cstdint>
 
-// Event-contract vocabulary. These used to live in ToyExchange's Core/Alias.hpp;
-// Core is protocol- and product-agnostic, so the domain choices sit here.
+// Event-contract vocabulary. Core is protocol- and product-agnostic,
+// so the domain choices sit here.
 
 using Price = std::uint8_t;
 // This exchange's whole price domain: event-contract cents, 0-100 inclusive.
