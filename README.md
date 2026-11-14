@@ -4,8 +4,8 @@
 
 A limit order book for binary-outcome event contracts (priced 0-100),
 speaking real NASDAQ OUCH 4.2 on ingress. Built on top of
-[ToyExchange](https://github.com/infinite-simplex/ToyExchange)'s
-Disruptor-style pipeline (Core v0.4.0, pinned in `CMakeLists.txt`) —
+[DisruptorExchange](https://github.com/infinite-simplex/DisruptorExchange)'s
+Disruptor-style pipeline (Core v0.1.0, pinned in `CMakeLists.txt`) —
 replicated, leader-elected matching with real failover, a sequenced
 memory-mapped log with gap-fill retransmit — via CMake `FetchContent` rather
 than a copy or a submodule.
@@ -17,7 +17,7 @@ This is a portfolio project, not a production exchange.
 Three processes: **NetworkServiceApp** (gateway — OUCH ingress, sequencing,
 memory-mapped log with gap-fill retransmit, leader arbitration, egress),
 **MatchingServiceApp** (N replicas of the matching engine, only the elected
-leader publishes), and optionally **PerformanceServiceApp** (from ToyExchange —
+leader publishes), and optionally **PerformanceServiceApp** (from DisruptorExchange —
 HdrHistogram latency percentiles aggregated across replicas; build it with
 `-DBUILD_PERFORMANCE_SERVICE=ON`, which fetches HdrHistogram_c). A custom compact
 frame on egress (no public ITCH feed yet).
@@ -104,7 +104,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 Matching engine, full network ingress pipeline, GTD auto-cancel, telemetry
-arena collision detection. CI runs this on every push. ToyExchange carries
+arena collision detection. CI runs this on every push. DisruptorExchange carries
 its own separate test suite for the pipeline primitives this repo consumes.
 
 ## License
